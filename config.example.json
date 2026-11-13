@@ -1,0 +1,18 @@
+{
+  "allowedOpenId": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+
+  "larkCliExe": "",
+  "claudeExe": "",
+  "skillsDir": "",
+  "claudeModel": "",
+
+  "claudeTimeoutMinutes": 10,
+  "ackText": "行吧，小八这就去弄",
+  "maxReplyChars": 4000,
+  "maxMessageAgeMinutes": 30,
+  "sessionIdleResetHours": 24,
+
+  "allowGroups": true,
+  "botOpenId": "",
+  "groupAckEmoji": "OnIt"
+}

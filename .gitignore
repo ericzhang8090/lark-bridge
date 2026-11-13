@@ -1,0 +1,10 @@
+# 运行时生成的数据（会话 ID、已处理消息、日志、临时回复文件）
+state/
+logs/
+work/
+
+# 由 install-autostart.ps1 按本机路径生成
+run-hidden.vbs
+
+# 本机配置（含个人 open_id）；仓库里提供 config.example.json
+config.json
