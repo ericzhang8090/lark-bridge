@@ -14,5 +14,11 @@
 
   "allowGroups": true,
   "botOpenId": "",
-  "groupAckEmoji": "OnIt"
+
+  "ackEmoji": "OnIt",
+  "doneEmoji": "DONE",
+  "failEmoji": "ERROR",
+  "maxConcurrent": 2,
+  "logRetentionDays": 7,
+  "alertAfterFailures": 3
 }
