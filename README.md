@@ -23,7 +23,7 @@
                    │     /q 前缀：用 quickModel（默认 haiku）开一次性会话，便宜、不带上下文
                    │     --restricted --strict-mcp-config --permission-mode dontAsk
                    │     --tools PowerShell[,Read,Glob,Grep] --allowedTools "PowerShell(lark-cli *)" ...
-                   │     --append-system-prompt-file system-prompt.md  （规则 + 人设）
+                   │     --append-system-prompt-file （system-prompt.md 规则 + 人设）
                    └─ 回复：单聊用 im +messages-send，群聊用 im +messages-reply（引用原消息）
                             正文写成文件，再用 --markdown @file 传给 lark-cli；超过 4000 字自动分段
 ```
@@ -43,8 +43,9 @@
 |---|---|
 | `bridge.js` | 主程序。`node bridge.js --check` 用于自检 |
 | `config.json` | 白名单 open_id、超时、回执文字、群聊开关等 |
-| `system-prompt.md` | 给 Claude 的规则和"小八"人设，每条消息都会重新读取，改完立即生效 |
-| `system-prompt.local.md` | 可选，不入库。存在时代替 `system-prompt.md`，用来给本机机器人换名字和人设，`git pull` 不会冲突 |
+| `system-prompt.md` | 给 Claude 的工作规则（入库，随 `git pull` 更新） |
+| `persona.md` | 默认人设（"小八"） |
+| `persona.local.md` | 可选，不入库。存在时代替 `persona.md`，用来给本机机器人换人设；名字用 config.json 的 `botName`。规则和人设每条消息都会重新拼接，改完立即生效 |
 | `install-autostart.ps1` | 生成 `run-hidden.vbs`，并注册"登录时启动"计划任务（失败时改用"启动"文件夹）。加 `-Uninstall` 卸载 |
 | `start.ps1` / `start-background.ps1` / `stop.ps1` | 前台运行（加 `-Check` 只自检）/ 后台启动 / 停止 |
 

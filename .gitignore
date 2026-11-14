@@ -9,5 +9,6 @@ run-hidden.vbs
 # 本机配置（含个人 open_id）；仓库里提供 config.example.json
 config.json
 
-# 本机自定义的人设/规则（存在时优先于 system-prompt.md）
+# 本机自定义的人设（存在时代替 persona.md）；以及旧版的整份提示词替换文件
+persona.local.md
 system-prompt.local.md

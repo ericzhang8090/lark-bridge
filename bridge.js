@@ -57,7 +57,7 @@ const DEFAULTS = {
   downloadAttachments: true, // 自动下载消息（含被引用消息）里的图片和文件交给 Claude
   maxAttachmentMB: 20, // 单个附件超过这个大小就不交给 Claude
   botName: '小八', // 机器人名字，用在进度消息和告警里
-  systemPromptFile: '', // 系统提示词文件；留空则优先用 system-prompt.local.md（不入库），没有再用 system-prompt.md
+  systemPromptFile: '', // 完整替换系统提示词的文件（规则+人设）；一般留空，用 persona.local.md 只换人设
 };
 
 function readJson(file, fallback) {
@@ -70,10 +70,29 @@ const userCfg = readJson(path.join(ROOT, 'config.json'), {});
 const cfg = Object.assign({}, DEFAULTS, userCfg);
 if (userCfg.ackEmoji === undefined && userCfg.groupAckEmoji !== undefined) cfg.ackEmoji = userCfg.groupAckEmoji; // 旧配置名
 cfg.maxConcurrent = Math.max(1, Number(cfg.maxConcurrent) || 1);
-// 本机的人设/规则可以放在不入库的 system-prompt.local.md 里，git pull 时不会冲突
-const SYSTEM_PROMPT_FILE = cfg.systemPromptFile
-  ? path.resolve(ROOT, cfg.systemPromptFile)
-  : [path.join(ROOT, 'system-prompt.local.md'), path.join(ROOT, 'system-prompt.md')].find((p) => fs.existsSync(p)) || path.join(ROOT, 'system-prompt.md');
+// 系统提示词 = system-prompt.md（规则，入库）+ 人设。人设优先用不入库的 persona.local.md，
+// 没有再用 persona.md。这样规则随 git pull 更新，本机人设不会冲突。
+// 兼容：config.systemPromptFile 或 system-prompt.local.md 存在时，直接用它完整替换。
+const RULES_FILE = path.join(ROOT, 'system-prompt.md');
+const COMBINED_PROMPT_FILE = path.join(WORK_DIR, 'system-prompt.combined.md');
+function promptSources() {
+  if (cfg.systemPromptFile) return { full: path.resolve(ROOT, cfg.systemPromptFile) };
+  const legacy = path.join(ROOT, 'system-prompt.local.md');
+  if (fs.existsSync(legacy)) return { full: legacy };
+  const persona = [path.join(ROOT, 'persona.local.md'), path.join(ROOT, 'persona.md')].find((p) => fs.existsSync(p)) || null;
+  return { rules: RULES_FILE, persona };
+}
+// 每次调用都重新拼接，改完规则或人设立即生效
+function systemPromptFile() {
+  const src = promptSources();
+  if (src.full) return src.full;
+  const strip = (p) => fs.readFileSync(p, 'utf8').replace(/^﻿/, '').trim();
+  const text = [strip(src.rules), src.persona ? strip(src.persona) : ''].filter(Boolean).join('\n\n') + '\n';
+  const tmp = `${COMBINED_PROMPT_FILE}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, text, 'utf8');
+  fs.renameSync(tmp, COMBINED_PROMPT_FILE);
+  return COMBINED_PROMPT_FILE;
+}
 if (!/^ou_[0-9a-z]+$/i.test(cfg.allowedOpenId)) {
   console.error('config.json 不存在或 allowedOpenId 无效：请把 config.example.json 复制为 config.json，并填写 allowedOpenId');
   process.exit(3);
@@ -438,7 +457,7 @@ async function runClaude(prompt, sessionId, ctl = {}, opts = {}) {
     '--strict-mcp-config', // 不加载任何 MCP 服务器
     '--permission-mode', 'dontAsk', // 不在白名单里的操作一律拒绝
     '--tools', tools.join(','),
-    '--append-system-prompt-file', SYSTEM_PROMPT_FILE,
+    '--append-system-prompt-file', systemPromptFile(),
   ];
   const model = opts.model || cfg.claudeModel;
   if (model) args.push('--model', model);
@@ -938,7 +957,10 @@ async function check() {
   console.log(`claude.exe   : ${claude || '未找到'}`);
   console.log(`lark skills  : ${skills || '未找到（不影响运行）'}`);
   console.log(`机器人名字   : ${cfg.botName}`);
-  console.log(`系统提示词   : ${SYSTEM_PROMPT_FILE}${fs.existsSync(SYSTEM_PROMPT_FILE) ? '' : '（文件不存在！）'}`);
+  const src = promptSources();
+  const fileState = (p) => (p ? `${p}${fs.existsSync(p) ? '' : '（文件不存在！）'}` : '（无）');
+  if (src.full) console.log(`系统提示词   : ${fileState(src.full)}（完整替换）`);
+  else { console.log(`规则         : ${fileState(src.rules)}`); console.log(`人设         : ${fileState(src.persona)}`); }
   console.log(`白名单 open_id: ${cfg.allowedOpenId}`);
   let ok = !!(lark && claude);
   if (lark) {
