@@ -16,7 +16,11 @@
                    ├─ 命令（/stop /new /status /help）立即执行，不排队
                    ├─ 回执：在原消息上加 OnIt 表情，完成后换成 DONE，出错或超时换成 ERROR（表情失败时单聊退回发文字）
                    ├─ 引用回复：用 im +messages-mget 取回被引用的原文，一起交给 Claude
+                   ├─ 附件：消息和被引用消息里的图片/文件先用 im +messages-resources-download
+                   │         下载到 work/inbox/，把路径交给 Claude 用 Read 查看（保留 1 天）
                    ├─ claude -p（prompt 从 stdin 传入；每个 chat_id 各自一个会话，用 --resume 延续）
+                   │     --output-format stream-json：边跑边统计步骤；超过 60 秒发进度消息并每分钟原地更新
+                   │     /q 前缀：用 quickModel（默认 haiku）开一次性会话，便宜、不带上下文
                    │     --restricted --strict-mcp-config --permission-mode dontAsk
                    │     --tools PowerShell[,Read,Glob,Grep] --allowedTools "PowerShell(lark-cli *)" ...
                    │     --append-system-prompt-file system-prompt.md  （规则 + 人设）
@@ -27,7 +31,8 @@
 关键设计：
 - **权限隔离**：Claude 只能执行 lark-cli，其他命令以及用 `;` 拼接的命令都会被拒绝。它不加载 MCP 服务器，也不读个人 settings；只额外开放一项只读权限，读取 lark skills 文档。
 - **不经过 cmd.exe**：bridge 直接启动 `lark-cli.exe`（就是 `lark-cli.cmd` 背后的那个程序），避免 `& | ^ %` 这类字符被 cmd 转义坏。
-- **命令**：`/stop` 停止本聊天正在跑的任务并取消排队的任务；`/new` 清空本聊天的上下文；`/status` 查看运行状态；`/help` 查看帮助。
+- **命令**：`/stop` 停止本聊天正在跑的任务并取消排队的任务；`/new` 清空本聊天的上下文；`/status` 查看运行状态；`/help` 查看帮助；`/q 问题` 用便宜模型快速回答。
+- **文件访问**：`--restricted` 把 Read 限制在工作目录（`work/`）和 lark skills 目录内，Claude 只能看到桥接程序下载的附件，读不到电脑上的其他文件。
 - **运维**：日志按天切分，保留 `logRetentionDays` 天；订阅连续失败 `alertAfterFailures` 次后，用机器人私聊告警，恢复后再通知一次。
 - **自愈**：订阅进程断开后按退避时间自动重连；`run-hidden.vbs` 守护 bridge，异常退出后 15 秒自动重启；用单实例锁防止重复运行。
 - **状态**：`state/state.json` 保存每个聊天的会话 ID 和已处理的消息 ID。
@@ -51,7 +56,7 @@
   - 群里 @机器人 的消息：`im:message.group_at_msg:readonly`
   - 以机器人身份发消息：`im:message:send_as_bot`
   - 表情回执：`im:message.reactions:write_only`
-  - 读取被引用的消息：`im:message:readonly`
+  - 读取被引用的消息、下载图片和文件：`im:message:readonly`
 - 改完后发布新版本。
 
 **2. 在要运行桥接的 Windows 账户下操作（凭据按用户存放，不能跨账户共用）**

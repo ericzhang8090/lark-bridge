@@ -20,5 +20,11 @@
   "failEmoji": "ERROR",
   "maxConcurrent": 2,
   "logRetentionDays": 7,
-  "alertAfterFailures": 3
+  "alertAfterFailures": 3,
+
+  "progressAfterSeconds": 60,
+  "progressIntervalSeconds": 60,
+  "quickModel": "haiku",
+  "downloadAttachments": true,
+  "maxAttachmentMB": 20
 }
