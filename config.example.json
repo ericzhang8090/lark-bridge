@@ -26,5 +26,8 @@
   "progressIntervalSeconds": 60,
   "quickModel": "haiku",
   "downloadAttachments": true,
-  "maxAttachmentMB": 20
+  "maxAttachmentMB": 20,
+
+  "botName": "小八",
+  "systemPromptFile": ""
 }

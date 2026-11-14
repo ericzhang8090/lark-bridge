@@ -26,7 +26,6 @@ const LOG_DIR = path.join(ROOT, 'logs');
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const LOCK_FILE = path.join(STATE_DIR, 'bridge.lock');
-const SYSTEM_PROMPT_FILE = path.join(ROOT, 'system-prompt.md');
 const EVENT_KEY = 'im.message.receive_v1';
 const LARK_REL = path.join('node_modules', '@larksuite', 'cli', 'bin', 'lark-cli.exe');
 
@@ -57,6 +56,8 @@ const DEFAULTS = {
   quickModel: 'haiku', // "/q 问题" 快速模式使用的模型
   downloadAttachments: true, // 自动下载消息（含被引用消息）里的图片和文件交给 Claude
   maxAttachmentMB: 20, // 单个附件超过这个大小就不交给 Claude
+  botName: '小八', // 机器人名字，用在进度消息和告警里
+  systemPromptFile: '', // 系统提示词文件；留空则优先用 system-prompt.local.md（不入库），没有再用 system-prompt.md
 };
 
 function readJson(file, fallback) {
@@ -69,6 +70,10 @@ const userCfg = readJson(path.join(ROOT, 'config.json'), {});
 const cfg = Object.assign({}, DEFAULTS, userCfg);
 if (userCfg.ackEmoji === undefined && userCfg.groupAckEmoji !== undefined) cfg.ackEmoji = userCfg.groupAckEmoji; // 旧配置名
 cfg.maxConcurrent = Math.max(1, Number(cfg.maxConcurrent) || 1);
+// 本机的人设/规则可以放在不入库的 system-prompt.local.md 里，git pull 时不会冲突
+const SYSTEM_PROMPT_FILE = cfg.systemPromptFile
+  ? path.resolve(ROOT, cfg.systemPromptFile)
+  : [path.join(ROOT, 'system-prompt.local.md'), path.join(ROOT, 'system-prompt.md')].find((p) => fs.existsSync(p)) || path.join(ROOT, 'system-prompt.md');
 if (!/^ou_[0-9a-z]+$/i.test(cfg.allowedOpenId)) {
   console.error('config.json 不存在或 allowedOpenId 无效：请把 config.example.json 复制为 config.json，并填写 allowedOpenId');
   process.exit(3);
@@ -720,7 +725,7 @@ function startProgress(ev, ctl, t0) {
   const render = () => {
     const secs = Math.round((Date.now() - t0) / 1000);
     const steps = ctl.steps ? `，已执行 ${ctl.steps} 步` : '';
-    return `⏳ 小八还在弄（${secs} 秒${steps}）\n最近一步：${ctl.lastStep || '思考中…'}\n\n发 /stop 可以中止`;
+    return `⏳ ${cfg.botName}还在弄（${secs} 秒${steps}）\n最近一步：${ctl.lastStep || '思考中…'}\n\n发 /stop 可以中止`;
   };
   const tick = () => {
     inflight = inflight.then(async () => {
@@ -903,7 +908,7 @@ function startConsumer() {
         alerted = true;
         // 网络断开时这条也发不出去；主要用于凭据过期、权限被收回等情况
         sendReply({ userId: cfg.allowedOpenId },
-          `⚠️ 飞书事件订阅连续失败 ${consecutiveFailures} 次（exit ${code}），小八暂时收不到消息，正在自动重试。\n\n最后的错误：${preview(lastErr, 300) || '（无）'}`,
+          `⚠️ 飞书事件订阅连续失败 ${consecutiveFailures} 次（exit ${code}），${cfg.botName}暂时收不到消息，正在自动重试。\n\n最后的错误：${preview(lastErr, 300) || '（无）'}`,
           `alert-${Date.now()}`).catch(() => {});
       }
     }
@@ -932,6 +937,8 @@ async function check() {
   console.log(`lark-cli.exe : ${lark || '未找到'}`);
   console.log(`claude.exe   : ${claude || '未找到'}`);
   console.log(`lark skills  : ${skills || '未找到（不影响运行）'}`);
+  console.log(`机器人名字   : ${cfg.botName}`);
+  console.log(`系统提示词   : ${SYSTEM_PROMPT_FILE}${fs.existsSync(SYSTEM_PROMPT_FILE) ? '' : '（文件不存在！）'}`);
   console.log(`白名单 open_id: ${cfg.allowedOpenId}`);
   let ok = !!(lark && claude);
   if (lark) {

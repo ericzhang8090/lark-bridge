@@ -8,3 +8,6 @@ run-hidden.vbs
 
 # 本机配置（含个人 open_id）；仓库里提供 config.example.json
 config.json
+
+# 本机自定义的人设/规则（存在时优先于 system-prompt.md）
+system-prompt.local.md

@@ -44,6 +44,7 @@
 | `bridge.js` | 主程序。`node bridge.js --check` 用于自检 |
 | `config.json` | 白名单 open_id、超时、回执文字、群聊开关等 |
 | `system-prompt.md` | 给 Claude 的规则和"小八"人设，每条消息都会重新读取，改完立即生效 |
+| `system-prompt.local.md` | 可选，不入库。存在时代替 `system-prompt.md`，用来给本机机器人换名字和人设，`git pull` 不会冲突 |
 | `install-autostart.ps1` | 生成 `run-hidden.vbs`，并注册"登录时启动"计划任务（失败时改用"启动"文件夹）。加 `-Uninstall` 卸载 |
 | `start.ps1` / `start-background.ps1` / `stop.ps1` | 前台运行（加 `-Check` 只自检）/ 后台启动 / 停止 |
 
