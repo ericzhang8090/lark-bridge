@@ -269,10 +269,33 @@ function saveState() {
 function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
+// 取进程命令行；查不到返回 null（进程不存在或无法判断）
+function processCommandLine(pid) {
+  try {
+    if (process.platform === 'win32') {
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`],
+        { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+      return r.status === 0 ? r.stdout.trim() : null;
+    }
+    const proc = `/proc/${pid}/cmdline`;
+    if (fs.existsSync(proc)) return fs.readFileSync(proc, 'utf8').replace(/\0/g, ' ').trim();
+    const r = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 15000 });
+    return r.status === 0 ? r.stdout.trim() : null;
+  } catch { return null; }
+}
+// 锁里的 pid 还活着，且确实是一个跑 bridge.js 的进程？
+// 关机/重启后锁文件会残留，pid 可能被别的程序复用，只看"活着"会误判为已有实例。
+function isBridgeInstance(pid) {
+  if (!isAlive(pid)) return false;
+  const cmd = processCommandLine(pid);
+  if (cmd === null) return true; // 判断不了时保守处理，避免双开
+  return /bridge\.js/i.test(cmd);
+}
 function acquireLock() {
   try {
     const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10);
-    if (pid && pid !== process.pid && isAlive(pid)) {
+    if (pid && pid !== process.pid && isBridgeInstance(pid)) {
       log('ERROR', `已有桥接实例在运行 (pid ${pid})，本进程退出`);
       process.exit(3);
     }
