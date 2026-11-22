@@ -11,6 +11,8 @@
   "skillsDir": "",
   "claudeModel": "",
   "geminiModel": "",
+  "agyExe": "",
+  "agyModel": "",
 
   "claudeTimeoutMinutes": 10,
   "ackText": "行吧，小八这就去弄",

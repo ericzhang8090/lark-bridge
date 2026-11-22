@@ -97,6 +97,29 @@ npm i -g @google/gemini-cli
 - **模型**：`geminiModel` 留空用 Gemini 默认（auto）；`/q` 默认用 `flash`。Gemini 不返回费用，日志里记录 token 数。
 - **入口路径**：自动查找 `%APPDATA%\npm\node_modules\@google\gemini-cli\bundle\gemini.js`，找不到时在 config.json 里填 `geminiScript`。
 
+> 注意：Google 已经不允许 Gemini CLI 用个人 Google 账号登录（会报 "This client is no longer supported for Gemini Code Assist for individuals"），只能用 `GEMINI_API_KEY`（按 token 计费）。有 Google AI Pro / Ultra 订阅、想用个人账号的，改用下面的 Antigravity CLI。
+
+## 换成 Antigravity CLI（`agent: "agy"`）
+
+用个人 Google 账号（AI Pro / Ultra 订阅）登录，不需要 API Key。
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex   # 安装到 %LOCALAPPDATA%\agy\bin\agy.exe
+cd <桥接目录>\work ; agy                                # 交互运行一次：浏览器登录 Google 账号、信任 work 目录，然后退出
+.\start.ps1 -Check
+```
+
+- **调用方式**：`agy.exe --input-format stream-json --output-format stream-json --settings <JSON> --disable-slash-commands [--model] [--conversation <ID>] [--add-dir <skills>]`，prompt 以 `{"event":"user","message":{"content":"..."}}` 从 stdin 传入；每个聊天的 `conversation_id` 用 `--conversation` 延续。
+- **权限**：通过 `--settings` 传入只对本次调用生效的设置，不改你的全局 `~/.gemini/antigravity-cli/settings.json`：
+  - `agentMode: ""` 关掉 auto 模式（auto 会自动放行它判断为"低风险"的命令，比如 `whoami`）
+  - `enableTerminalSandbox: false`：lark-cli 要读 `~/.lark-cli` 和钥匙串，在沙箱里跑不了
+  - 只放行 lark-cli 的正则规则；不以 lark-cli 开头的命令、引号外带 `; | & $` 等拼接符号的命令、写文件，都放进 deny 列表
+- **为什么用 deny 而不是只靠 allow**：agy 无头模式下，落在"需要确认"的操作会被自动拒绝并**直接结束整轮**（前面的结果也丢了）；明确 deny 的操作只会把错误告诉模型，它会接着把能做的做完。
+- **实测的坑**（agy 1.5.14，Windows）：`command(lark-cli)` 这种前缀写法不生效，只能用 `command(regex:...)`；regex 匹配整行，所以必须排除 `; | & $` 等字符，否则 `lark-cli x; whoami` 也会被放行。参数里需要这些字符时，用单引号括起来。
+- **系统提示词**：`system-prompt.md` + 人设写成 `work/AGENTS.md`（agy 读取工作目录里的 AGENTS.md）。
+- **模型**：`agyModel` 留空用 agy 默认；`/q` 默认用 `gemini-3.8-flash-low`。可选值用 `agy models` 查看。agy 不返回费用，日志里记录 token 数。
+- **登录**：凭据存在 Windows 凭据管理器里，自检无法确认是否已登录；过期时机器人会回复提示，重新交互运行一次 `agy` 登录即可。
+
 ## 在同一台电脑上再跑一个机器人
 
 每个实例要用**不同的飞书应用**（同一个应用同时跑两个长连接会互相抢消息）和**不同的目录**（锁文件、会话、日志都在程序目录里）。

@@ -39,11 +39,13 @@ const DEFAULTS = {
   allowedOpenId: '',
   instanceName: '', // 同一台电脑跑多个实例时用来区分（开机自启的计划任务名）
   larkProfile: '', // lark-cli 的 profile（多个飞书应用时用 lark-cli config init --name 创建）；留空用默认
-  agent: 'claude', // 用哪个 CLI agent：claude | gemini
+  agent: 'claude', // 用哪个 CLI agent：claude | gemini | agy（Antigravity CLI）
   larkCliExe: '',
   claudeExe: '',
   geminiScript: '', // gemini-cli 入口 js（@google/gemini-cli 包里的 bundle/gemini.js）；留空自动查找
   geminiModel: '',
+  agyExe: '', // Antigravity CLI 的 agy.exe；留空自动查找（%LOCALAPPDATA%\agy\bin、PATH）
+  agyModel: '', // 留空用 agy 默认模型；可选值用 agy models 查看
   skillsDir: '',
   claudeModel: '',
   claudeTimeoutMinutes: 10,
@@ -79,11 +81,11 @@ const cfg = Object.assign({}, DEFAULTS, userCfg);
 if (userCfg.ackEmoji === undefined && userCfg.groupAckEmoji !== undefined) cfg.ackEmoji = userCfg.groupAckEmoji; // 旧配置名
 cfg.maxConcurrent = Math.max(1, Number(cfg.maxConcurrent) || 1);
 cfg.agent = String(cfg.agent || 'claude').toLowerCase();
-if (!['claude', 'gemini'].includes(cfg.agent)) {
-  console.error(`config.json 里的 agent 只能是 claude 或 gemini，当前是 ${cfg.agent}`);
+if (!['claude', 'gemini', 'agy'].includes(cfg.agent)) {
+  console.error(`config.json 里的 agent 只能是 claude、gemini 或 agy，当前是 ${cfg.agent}`);
   process.exit(3);
 }
-if (!cfg.quickModel) cfg.quickModel = cfg.agent === 'gemini' ? 'flash' : 'haiku';
+if (!cfg.quickModel) cfg.quickModel = { claude: 'haiku', gemini: 'flash', agy: 'gemini-3.8-flash-low' }[cfg.agent];
 // 系统提示词 = system-prompt.md（规则，入库）+ 人设。人设优先用不入库的 persona.local.md，
 // 没有再用 persona.md。这样规则随 git pull 更新，本机人设不会冲突。
 // 兼容：config.systemPromptFile 或 system-prompt.local.md 存在时，直接用它完整替换。
@@ -195,9 +197,21 @@ function resolveGemini() {
   ]);
 }
 
-// 当前 agent 的可执行文件说明，用于启动日志和自检
+function resolveAgy() {
+  if (cfg.agyExe) return fs.existsSync(cfg.agyExe) ? cfg.agyExe : null;
+  const local = path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin', 'agy.exe');
+  if (fs.existsSync(local)) return local;
+  const w = spawnSync('where.exe', ['agy.exe'], { encoding: 'utf8', windowsHide: true });
+  if (w.status === 0) {
+    const p = w.stdout.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (p) return p;
+  }
+  return null;
+}
+
+// 当前 agent 的可执行文件，用于启动日志和自检
 function agentExeLabel() {
-  return cfg.agent === 'gemini' ? resolveGemini() : resolveClaude();
+  return { claude: resolveClaude, gemini: resolveGemini, agy: resolveAgy }[cfg.agent]();
 }
 
 function resolveSkillsDir() {
@@ -480,8 +494,8 @@ function parseJsonOutput(stdout) {
 // 把一次工具调用概括成一句话，用于进度消息和 /status（同时认 Claude 和 Gemini 的工具名）
 function describeTool(t) {
   const i = t.input || {};
-  if (['PowerShell', 'Bash', 'run_shell_command'].includes(t.name)) return preview(i.description || i.command, 80);
-  if (t.name === 'Read' || t.name === 'read_file') return `读取 ${path.basename(String(i.file_path || i.absolute_path || i.path || ''))}`;
+  if (['PowerShell', 'Bash', 'run_shell_command', 'run_command'].includes(t.name)) return preview(i.description || i.command || i.CommandLine, 80);
+  if (['Read', 'read_file', 'view_file'].includes(t.name)) return `读取 ${path.basename(String(i.file_path || i.absolute_path || i.path || i.AbsolutePath || i.Path || ''))}`;
   if (['Glob', 'Grep', 'glob', 'grep_search'].includes(t.name)) return `查找 ${preview(i.pattern, 60)}`;
   return t.name;
 }
@@ -676,7 +690,116 @@ async function runGemini(prompt, sessionId, ctl = {}, opts = {}) {
   return { ok: false, sessionId: acc.sessionId || sessionId, text: `处理出错（exit ${r.code}）：\n${detail}` };
 }
 
-const runAgent = cfg.agent === 'gemini' ? runGemini : runClaude;
+// ---------- 调用 Antigravity CLI（agy） ----------
+// 用个人 Google 账号（AI Pro / Ultra 订阅）登录，凭据在 Windows 凭据管理器里；先交互运行一次 agy 登录。
+// 限制方式：--settings 传入本次会话专用的设置（不写入你的全局 settings.json）：
+//   - agentMode ""：关掉 auto 模式（auto 会自动放行它认为"低风险"的命令）
+//   - enableTerminalSandbox false：lark-cli 要读 ~/.lark-cli 和钥匙串，在沙箱里跑不了
+//   - 只放行 lark-cli 的正则规则；其他命令需要确认，无头模式下自动拒绝
+//   - 写文件一律拒绝
+// 实测（agy 1.5.14，Windows）：command(lark-cli) 这种前缀写法不生效，只能用 regex；
+// regex 匹配整行，所以要排除 ; | & $ ` < > ( ) 这些能拼接或嵌入其他命令的字符（引号里的除外，
+// 双引号里不允许 $ 和 `，因为 PowerShell 会在双引号里展开变量和子表达式）。
+const AGY_LARK_RULE = 'command(regex:lark-cli([.](cmd|exe|ps1))?( +(\'[^\'\\r\\n]*\'|"[^"$`\\r\\n]*"|[^\\s;|&$`<>()\'"]+))* *)';
+// 明确"拒绝"的操作会把错误告诉模型、让它接着做；落在"需要确认"的操作在无头模式下会直接结束整轮（前面的结果也丢了）。
+// 所以把明显不该执行的命令也写进 deny：不是以 lark-cli 开头的命令、以及引号外带拼接符号的 lark-cli 命令。
+const AGY_DENY_RULES = [
+  'write_file(*)',
+  'command(regex:([^l].*|l([^a].*)?|la([^r].*)?|lar([^k].*)?|lark([^-].*)?|lark-([^c].*)?|lark-c([^l].*)?|lark-cl([^i].*)?|lark-cli[^ .].*)?)',
+  'command(regex:lark-cli[^\'"]*[;|&$`<>].*)',
+];
+const AGY_SETTINGS = {
+  agentMode: '',
+  enableTerminalSandbox: false,
+  toolPermission: 'request-review',
+  allowNonWorkspaceAccess: false,
+  permissions: { allow: [AGY_LARK_RULE], deny: AGY_DENY_RULES },
+};
+// agy 没有"追加系统提示词"参数：规则和人设写成工作目录下的 AGENTS.md（只对 work/ 生效）
+const AGY_RULES_NOTE = `
+
+# 命令格式限制（Antigravity）
+
+lark-cli 的参数里不要出现 ; | & $ \` < > ( ) 这些字符，否则整条命令会被拒绝。参数里需要这些字符时，用单引号把整个参数括起来，例如 --text '内容 (备注)'。不要用双引号包含 $ 或反引号。
+`;
+
+function onAgyLine(line, ctl, acc) {
+  if (!line.startsWith('{')) return;
+  let m;
+  try { m = JSON.parse(line); } catch { return; }
+  if (m.conversation_id) acc.sessionId = m.conversation_id;
+  if (m.event === 'step_update') {
+    const s = m.step_update || {};
+    if (s.step_type === 'tool' && s.state === 'ACTIVE' && s.tool_info) {
+      ctl.steps = (ctl.steps || 0) + 1;
+      ctl.lastStep = describeTool({ name: s.tool_info.name, input: s.tool_info.parameters });
+    }
+  } else if (m.event === 'result') acc.result = m.result || {};
+}
+
+async function runAgy(prompt, sessionId, ctl = {}, opts = {}) {
+  const exe = resolveAgy();
+  if (!exe) return { ok: false, text: '找不到 agy.exe，请先安装 Antigravity CLI（irm https://antigravity.google/cli/install.ps1 | iex），或在 config.json 里设置 agyExe。' };
+  const src = fs.readFileSync(systemPromptFile(), 'utf8');
+  fs.writeFileSync(path.join(WORK_DIR, 'AGENTS.md'), src.trimEnd() + AGY_RULES_NOTE, 'utf8');
+  const skills = resolveSkillsDir();
+  const args = [
+    '--input-format', 'stream-json', // 提示词从 stdin 传入，不受命令行长度限制
+    '--output-format', 'stream-json',
+    '--settings', JSON.stringify(AGY_SETTINGS),
+    '--disable-slash-commands',
+  ];
+  const model = opts.model || cfg.agyModel;
+  if (model) args.push('--model', model);
+  if (sessionId) args.push('--conversation', sessionId);
+  if (skills) args.push('--add-dir', skills); // 只读 lark skills 文档（写文件已被拒绝）
+  const input = JSON.stringify({ event: 'user', message: { content: prompt } }) + '\n';
+
+  const t0 = Date.now();
+  const decoder = new StringDecoder('utf8');
+  const acc = { sessionId: null, result: null };
+  let buf = '';
+  const r = await runProcess(exe, args, {
+    input, timeoutMs: cfg.claudeTimeoutMinutes * 60000, onSpawn: (c) => { ctl.child = c; },
+    onStdout: (b) => {
+      buf += decoder.write(b);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { onAgyLine(buf.slice(0, i).trim(), ctl, acc); buf = buf.slice(i + 1); }
+    },
+  });
+  if (buf.trim()) onAgyLine(buf.trim(), ctl, acc);
+  ctl.child = null;
+  const secs = Math.round((Date.now() - t0) / 1000);
+  if (ctl.stopped) {
+    log('INFO', `agy 被 /stop 中止 (${secs}s)`);
+    return { ok: false, stopped: true };
+  }
+  if (r.timedOut) {
+    log('WARN', `agy 超时 (${secs}s)`);
+    return { ok: false, text: `⏱ 任务超过 ${cfg.claudeTimeoutMinutes} 分钟没有完成，已中止。` };
+  }
+  const res = acc.result || {};
+  const usage = res.usage || {};
+  const denied = Array.isArray(res.denied_actions) ? res.denied_actions : [];
+  log('INFO', `agy 结束 exit=${r.code} ${secs}s status=${res.status} tokens=${usage.total_tokens ?? '?'}${denied.length ? ` 被拒绝的操作=${JSON.stringify(denied)}` : ''}`);
+  const sid = acc.sessionId || sessionId;
+  const text = String(res.response || '').trim();
+  if (res.status === 'SUCCESS') {
+    // 遇到被拒绝的操作时 agy 会直接结束本轮，回答可能是空的
+    const fallback = denied.length
+      ? `有操作被权限规则拒绝了（只允许执行 lark-cli，且参数里不能有 ; | & $ 等符号），没能完成。可以换个说法再试，或拆成更简单的步骤。`
+      : '（任务已完成，没有文字输出）';
+    return { ok: !(!text && denied.length), secs, cost: null, tokens: usage.total_tokens, sessionId: sid, text: text || fallback };
+  }
+  const err = res.error ? (typeof res.error === 'string' ? res.error : res.error.message || JSON.stringify(res.error)) : '';
+  const detail = err || (r.stderr || r.stdout).trim().slice(-800);
+  if (/authenticat/i.test(detail)) {
+    return { ok: false, text: 'agy 没有登录或登录已过期：请在电脑上打开 PowerShell 运行一次 agy，按提示用 Google 账号登录后再试。' };
+  }
+  return { ok: false, sessionId: sid, text: `处理出错（${res.status || `exit ${r.code}`}）：\n${detail}` };
+}
+
+const runAgent = { claude: runClaude, gemini: runGemini, agy: runAgy }[cfg.agent];
 
 // ---------- 消息处理 ----------
 const startedAt = Date.now();
@@ -1134,7 +1257,7 @@ async function check() {
   console.log(`lark-cli.exe : ${lark || '未找到'}`);
   console.log(`lark profile : ${cfg.larkProfile || '（默认）'}`);
   console.log(`agent        : ${cfg.agent}`);
-  console.log(`${cfg.agent === 'gemini' ? 'gemini.js   ' : 'claude.exe  '} : ${agentExe || '未找到'}`);
+  console.log(`${{ claude: 'claude.exe  ', gemini: 'gemini.js   ', agy: 'agy.exe     ' }[cfg.agent]} : ${agentExe || '未找到'}`);
   if (cfg.agent === 'gemini') console.log(`gemini 数据  : ${GEMINI_HOME}`);
   console.log(`lark skills  : ${skills || '未找到（不影响运行）'}`);
   console.log(`机器人名字   : ${cfg.botName}`);
@@ -1162,7 +1285,8 @@ async function check() {
     if (!authed) ok = false;
   } else if (agentExe) {
     const r = await runProcess(agentExe, ['--version'], { timeoutMs: 30000 });
-    console.log(`claude 版本  : ${(r.stdout || r.stderr).trim()}`);
+    console.log(`${cfg.agent} 版本${cfg.agent === 'agy' ? '   ' : ''}  : ${(r.stdout || r.stderr).trim()}`);
+    if (cfg.agent === 'agy') console.log('agy 登录     : 用交互模式运行一次 agy 登录 Google 账号；凭据在 Windows 凭据管理器里，自检无法确认');
   }
   console.log(ok ? '\n自检通过' : '\n自检未通过，请按上面的提示修复');
   return ok ? 0 : 1;
