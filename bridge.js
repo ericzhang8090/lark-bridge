@@ -68,6 +68,13 @@ const DEFAULTS = {
   maxAttachmentMB: 20, // 单个附件超过这个大小就不交给 Claude
   botName: '小八', // 机器人名字，用在进度消息和告警里
   systemPromptFile: '', // 完整替换系统提示词的文件（规则+人设）；一般留空，用 persona.local.md 只换人设
+  // 群聊讨论（两个机器人轮流发言）：两个实例填同一个 discussionDir，各自填对方的名字
+  discussionDir: '', // 共享文件夹，放讨论记录；留空 = 不启用讨论
+  discussionPeer: '', // 对方机器人的名字（对方 config 里的 botName）
+  discussionHost: false, // 是否由本机器人主持（接收 /讨论 命令、先发言、做总结）；两个实例里只开一个
+  discussionDefaultRounds: 3,
+  discussionMaxRounds: 10,
+  discussionInThread: true, // 讨论发在发起消息下的话题里，不刷屏
 };
 
 function readJson(file, fallback) {
@@ -516,8 +523,9 @@ function onStreamLine(line, ctl) {
 async function runClaude(prompt, sessionId, ctl = {}, opts = {}) {
   const exe = resolveClaude();
   if (!exe) return { ok: false, text: '找不到 claude 可执行文件，请在 config.json 里设置 claudeExe。' };
-  const skills = resolveSkillsDir();
-  const tools = ['PowerShell', 'Read', ...(skills ? ['Glob', 'Grep'] : [])];
+  const skills = opts.noTools ? null : resolveSkillsDir();
+  // opts.noTools：讨论模式只聊不动手，不给任何工具
+  const tools = opts.noTools ? [] : ['PowerShell', 'Read', ...(skills ? ['Glob', 'Grep'] : [])];
   const args = [
     '-p', '--output-format', 'stream-json', '--verbose', // 逐条输出事件，用来跟踪进度；最后一行是 result
     '--restricted', // 忽略用户/项目 settings，代码执行类工具只保留 --tools 指定的
@@ -529,9 +537,11 @@ async function runClaude(prompt, sessionId, ctl = {}, opts = {}) {
   const model = opts.model || cfg.claudeModel;
   if (model) args.push('--model', model);
   if (sessionId) args.push('--resume', sessionId);
-  args.push('--allowedTools', ...LARK_ALLOW_RULES,
-    'Read(./inbox/**)', // 读取桥接程序下载的附件
-    ...(skills ? ['Read', 'Glob', 'Grep'] : []));
+  if (!opts.noTools) {
+    args.push('--allowedTools', ...LARK_ALLOW_RULES,
+      'Read(./inbox/**)', // 读取桥接程序下载的附件
+      ...(skills ? ['Read', 'Glob', 'Grep'] : []));
+  }
   if (skills) args.push('--add-dir', skills); // 只读 lark skills 文档
 
   const t0 = Date.now();
@@ -601,11 +611,13 @@ decision = "deny"
 priority = 800
 `;
 
-function prepareGeminiHome() {
+function prepareGeminiHome(noTools = false) {
   const dotDir = path.join(GEMINI_HOME, '.gemini');
   fs.mkdirSync(dotDir, { recursive: true });
-  const policyFile = path.join(GEMINI_HOME, 'bridge-policy.toml');
-  fs.writeFileSync(policyFile, GEMINI_POLICY, 'utf8');
+  const policyFile = path.join(GEMINI_HOME, noTools ? 'bridge-policy-notools.toml' : 'bridge-policy.toml');
+  // 只聊不动手：去掉放行 lark-cli 的那条规则，shell 一律拒绝
+  const policy = noTools ? GEMINI_POLICY.replace(/\[\[rule\]\]\ntoolName = "run_shell_command"\ncommandPrefix[\s\S]*?priority = 900\n\n/, '') : GEMINI_POLICY;
+  fs.writeFileSync(policyFile, policy, 'utf8');
   fs.copyFileSync(systemPromptFile(), path.join(dotDir, 'GEMINI.md'));
   return policyFile;
 }
@@ -629,8 +641,8 @@ function onGeminiLine(line, ctl, acc) {
 async function runGemini(prompt, sessionId, ctl = {}, opts = {}) {
   const script = resolveGemini();
   if (!script) return { ok: false, text: '找不到 Gemini CLI，请先运行 npm install -g @google/gemini-cli，或在 config.json 里设置 geminiScript。' };
-  const policyFile = prepareGeminiHome();
-  const skills = resolveSkillsDir();
+  const policyFile = prepareGeminiHome(!!opts.noTools);
+  const skills = opts.noTools ? null : resolveSkillsDir();
   const args = [
     script,
     '--output-format', 'stream-json',
@@ -742,11 +754,15 @@ async function runAgy(prompt, sessionId, ctl = {}, opts = {}) {
   if (!exe) return { ok: false, text: '找不到 agy.exe，请先安装 Antigravity CLI（irm https://antigravity.google/cli/install.ps1 | iex），或在 config.json 里设置 agyExe。' };
   const src = fs.readFileSync(systemPromptFile(), 'utf8');
   fs.writeFileSync(path.join(WORK_DIR, 'AGENTS.md'), src.trimEnd() + AGY_RULES_NOTE, 'utf8');
-  const skills = resolveSkillsDir();
+  const skills = opts.noTools ? null : resolveSkillsDir();
+  // 只聊不动手：不放行任何命令，所有命令都进 deny（deny 不会中断整轮）
+  const settings = opts.noTools
+    ? { ...AGY_SETTINGS, permissions: { allow: [], deny: ['write_file(*)', 'command(regex:.*)'] } }
+    : AGY_SETTINGS;
   const args = [
     '--input-format', 'stream-json', // 提示词从 stdin 传入，不受命令行长度限制
     '--output-format', 'stream-json',
-    '--settings', JSON.stringify(AGY_SETTINGS),
+    '--settings', JSON.stringify(settings),
     '--disable-slash-commands',
   ];
   const model = opts.model || cfg.agyModel;
@@ -1002,9 +1018,11 @@ async function runCommand(cmd, ev) {
     const wasRunning = !!c.ctl;
     c.gen++;
     if (c.ctl) { c.ctl.stopped = true; if (c.ctl.child) killTree(c.ctl.child.pid); }
+    const discussions = stopDiscussions(ev.chat_id);
     const parts = [];
     if (wasRunning) parts.push('已停止当前任务');
     if (cancelled) parts.push(`取消了 ${cancelled} 条排队中的任务`);
+    if (discussions) parts.push(`结束了 ${discussions} 场讨论`);
     await sendReply(target, parts.length ? `${parts.join('，')}。` : '当前没有在跑的任务。', id);
   } else if (cmd === 'status') {
     const up = Math.round((Date.now() - startedAt) / 60000);
@@ -1024,6 +1042,9 @@ async function runCommand(cmd, ev) {
       '- `/stop` 停止本聊天正在跑的任务，并取消排队的任务',
       '- `/new` 开启新会话（清空本聊天的上下文）',
       '- `/status` 查看运行状态',
+      ...(DISCUSS_ENABLED ? [cfg.discussionHost
+        ? `- \`/讨论 3轮 话题\`（群里）让我和 ${cfg.discussionPeer} 围绕话题轮流发言，最后我来总结；/stop 可以随时结束`
+        : `- 群里 @${cfg.discussionPeer} 发 \`/讨论 3轮 话题\`，我们俩会轮流发言`] : []),
     ].join('\n'), id);
   }
 }
@@ -1171,9 +1192,190 @@ async function handleEventLine(line) {
   log('INFO', `收到${isGroup ? '群聊 @' : '单聊'}消息 ${id} [${ev.message_type}]${ev.reply_to ? ' (引用回复)' : ''} ${preview(ev.text)}`);
   const cmd = COMMANDS[ev.text.toLowerCase()];
   if (cmd) { await runCommand(cmd, ev); return; }
+  const dc = parseDiscussCommand(ev);
+  if (dc) { await startDiscussion(ev, dc); return; }
   const q = /^\/q(?:uick)?\s+([\s\S]+)$/i.exec(ev.text);
   if (q) { ev.quick = true; ev.text = q[1].trim(); }
   enqueue(ev);
+}
+
+// ---------- 群聊讨论（两个机器人轮流发言） ----------
+// 飞书不一定会把一个机器人发的消息推送给另一个机器人，所以两个桥接程序不靠互相 @，
+// 而是在本机通过共享文件夹交接：每场讨论一个 JSON 记录，next 字段写着轮到谁。
+// 每个桥接每隔几秒扫一次，轮到自己就让自己的 agent（只聊不动手）生成发言，用自己的机器人身份发到群里，
+// 再把发言追加进记录、把 next 交给对方。主持方负责建记录、先发言、最后总结，以及发现对方没响应时收尾。
+const DISCUSS_ENABLED = !!(cfg.discussionDir && cfg.discussionPeer);
+const DISCUSS_DIR = DISCUSS_ENABLED ? path.resolve(ROOT, cfg.discussionDir) : null;
+const DISCUSS_POLL_MS = 3000;
+const discussBusy = new Map(); // 讨论 id -> ctl（本机正在为它生成发言）
+
+function discussFile(id) { return path.join(DISCUSS_DIR, `d-${id}.json`); }
+function readDiscussion(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+function writeDiscussion(d) {
+  d.updatedAt = Date.now();
+  const file = discussFile(d.id);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+// 写入前重新读一遍：对方可能刚把它标成 stopped
+function updateDiscussion(id, fn) {
+  const d = readDiscussion(discussFile(id));
+  if (!d) return null;
+  if (fn(d) === false) return d;
+  writeDiscussion(d);
+  return d;
+}
+
+// "/讨论 3轮 话题" 或 "/讨论 话题"
+function parseDiscussCommand(ev) {
+  if (!DISCUSS_ENABLED || ev.chat_type !== 'group') return null;
+  let t = ev.text;
+  for (const m of ev.mentions || []) { // 去掉对方机器人等其他 @
+    if (m && m.name) t = t.split(`@${m.name}`).join(' ');
+    if (m && m.key) t = t.split(m.key).join(' ');
+  }
+  t = t.replace(/\s+/g, ' ').trim();
+  const m = /^\/(?:讨论|discuss)(?:\s+(\d+)\s*轮?)?\s+([\s\S]+)$/i.exec(t);
+  if (!m) return null;
+  const rounds = Math.min(Math.max(Number(m[1]) || cfg.discussionDefaultRounds, 1), cfg.discussionMaxRounds);
+  return { rounds, topic: m[2].trim() };
+}
+
+async function startDiscussion(ev, cmd) {
+  const target = replyTarget(ev);
+  if (!cfg.discussionHost) {
+    log('INFO', `收到 /讨论，但本机器人不是主持方，忽略（由 ${cfg.discussionPeer} 主持）`);
+    return;
+  }
+  fs.mkdirSync(DISCUSS_DIR, { recursive: true });
+  const d = {
+    id: ev.message_id, chatId: ev.chat_id, rootMessageId: ev.message_id,
+    topic: cmd.topic, rounds: cmd.rounds, host: cfg.botName, guest: cfg.discussionPeer,
+    turns: [], next: cfg.botName, status: 'running', createdAt: Date.now(),
+  };
+  writeDiscussion(d);
+  log('INFO', `开始讨论 ${d.id}：${preview(d.topic)}（${d.rounds} 轮，${d.host} vs ${d.guest}）`);
+  await sendReply(target, `🎙️ 讨论开始：**${d.topic}**\n${d.host} 和 ${d.guest} 各发言 ${d.rounds} 轮，最后由 ${d.host} 总结。${cfg.discussionInThread ? '发言都在这条消息的话题里。' : ''}\n随时 @ 任意一方发 /stop 结束。`, `${d.id}-dstart`);
+}
+
+// 本聊天里正在进行的讨论全部停止（/stop 时调用）；返回停止的场数
+function stopDiscussions(chatId) {
+  if (!DISCUSS_ENABLED || !fs.existsSync(DISCUSS_DIR)) return 0;
+  let n = 0;
+  for (const name of fs.readdirSync(DISCUSS_DIR)) {
+    if (!/^d-.+\.json$/.test(name)) continue;
+    const d = readDiscussion(path.join(DISCUSS_DIR, name));
+    if (!d || d.chatId !== chatId || d.status !== 'running') continue;
+    updateDiscussion(d.id, (x) => { if (x.status !== 'running') return false; x.status = 'stopped'; x.endedBy = cfg.botName; });
+    const ctl = discussBusy.get(d.id);
+    if (ctl) { ctl.stopped = true; if (ctl.child) killTree(ctl.child.pid); }
+    n++;
+  }
+  return n;
+}
+
+function discussPrompt(d, isSummary) {
+  const me = cfg.botName;
+  const other = me === d.host ? d.guest : d.host;
+  const myTurns = d.turns.filter((t) => t.speaker === me).length;
+  const history = d.turns.length
+    ? d.turns.map((t) => `【${t.speaker}】${t.text}`).join('\n\n')
+    : '（还没有人发言，你先开场。）';
+  const head = [
+    '# 群聊讨论（这一条不是普通任务）',
+    '',
+    `你是 ${me}，正在飞书群里和另一个 AI 助理 ${other} 公开讨论，用户在旁观。`,
+    `话题：${d.topic}`,
+    '',
+    '规则：',
+    '- 这是纯对话：不要调用任何工具、不要运行任何命令、不要查用户的数据，只基于常识和推理发言。',
+    '- 不要 @ 任何人，不要透露用户的私人信息。',
+    '- 你最终输出的文字会被直接发到群里，所以只输出发言本身，不要加"好的""以下是我的发言"之类的话。',
+    '- 保持你自己的人设和语气。',
+    '',
+    '## 之前的发言',
+    '',
+    history,
+    '',
+  ];
+  if (isSummary) {
+    head.push(`## 你的任务`, '', `讨论已经结束。请作为主持人做一个简短总结（250 字以内）：双方各自的核心观点、共识、分歧，以及给用户的一句建议。`);
+  } else {
+    head.push('## 你的任务', '',
+      `现在是你的第 ${myTurns + 1} / ${d.rounds} 轮发言。${d.turns.length ? `回应 ${other} 上一轮的观点（可以反驳、补充或部分认同），并提出你自己的论点。` : '先亮明你的立场和主要理由。'}`,
+      '控制在 200 字以内，观点鲜明，不要重复之前说过的话。');
+  }
+  return head.join('\n');
+}
+
+async function takeDiscussionTurn(d) {
+  const me = cfg.botName;
+  const isSummary = d.turns.length >= d.rounds * 2; // 双方都说完了：主持方做总结
+  const ctl = { child: null, stopped: false, steps: 0, lastStep: '' };
+  discussBusy.set(d.id, ctl);
+  const label = isSummary ? '📝 总结' : `第 ${d.turns.filter((t) => t.speaker === me).length + 1} 轮`;
+  try {
+    await acquireSlot();
+    let res;
+    try {
+      if (readDiscussion(discussFile(d.id))?.status !== 'running') return;
+      log('INFO', `讨论 ${d.id}：${me} ${label}`);
+      res = await runAgent(discussPrompt(d, isSummary), null, ctl, { noTools: true });
+    } finally { releaseSlot(); }
+    if (ctl.stopped || res.stopped) return;
+    const cur = readDiscussion(discussFile(d.id));
+    if (!cur || cur.status !== 'running') return; // 期间被 /stop 了
+    const target = { replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread };
+    if (!res.ok) {
+      updateDiscussion(d.id, (x) => { x.status = 'error'; x.error = preview(res.text, 300); });
+      await sendReply(target, `⚠️ ${me} 这一轮出错了，讨论结束：${preview(res.text, 300)}`, `${d.id}-err-${cur.turns.length}`);
+      return;
+    }
+    await sendReply(target, `**${label}**\n\n${res.text}`, `${d.id}-turn-${cur.turns.length}`);
+    updateDiscussion(d.id, (x) => {
+      if (x.status !== 'running') return false;
+      x.turns.push({ speaker: me, text: res.text, at: Date.now(), summary: isSummary || undefined });
+      if (isSummary) { x.status = 'done'; x.next = null; return; }
+      // 双方都说完 rounds 轮后，交回主持方做总结
+      x.next = x.turns.length >= x.rounds * 2 ? x.host : (me === x.host ? x.guest : x.host);
+    });
+  } catch (e) {
+    log('ERROR', `讨论 ${d.id} 发言失败：`, e && e.stack || e);
+    updateDiscussion(d.id, (x) => { x.status = 'error'; x.error = String(e && e.message || e); });
+  } finally {
+    discussBusy.delete(d.id);
+  }
+}
+
+function pollDiscussions() {
+  if (!DISCUSS_ENABLED || shuttingDown) return;
+  let names = [];
+  try { names = fs.readdirSync(DISCUSS_DIR); } catch { return; }
+  const now = Date.now();
+  for (const name of names) {
+    if (!/^d-.+\.json$/.test(name)) continue;
+    const file = path.join(DISCUSS_DIR, name);
+    const d = readDiscussion(file);
+    if (!d) continue;
+    const ctl = discussBusy.get(d.id);
+    if (ctl && d.status !== 'running') { ctl.stopped = true; if (ctl.child) killTree(ctl.child.pid); continue; }
+    if (d.status !== 'running') {
+      // 结束超过 1 天的记录清理掉
+      if (now - (d.updatedAt || 0) > 86400000) { try { fs.unlinkSync(file); } catch { /* ignore */ } }
+      continue;
+    }
+    if (d.next === cfg.botName) {
+      if (!ctl) takeDiscussionTurn(d);
+    } else if (cfg.discussionHost && d.host === cfg.botName && now - d.updatedAt > (cfg.claudeTimeoutMinutes + 2) * 60000) {
+      // 对方超时没发言（可能没在运行）：主持方收尾
+      const who = d.next;
+      updateDiscussion(d.id, (x) => { if (x.status !== 'running' || x.next !== who) return false; x.status = 'error'; x.error = `${who} 没有响应`; });
+      sendReply({ replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread }, `⚠️ ${who} 超过 ${cfg.claudeTimeoutMinutes + 2} 分钟没有发言（可能没在运行），讨论结束。`, `${d.id}-timeout`).catch(() => {});
+    }
+  }
 }
 
 // ---------- 事件订阅（长连接） ----------
@@ -1266,6 +1468,7 @@ async function check() {
   if (src.full) console.log(`系统提示词   : ${fileState(src.full)}（完整替换）`);
   else { console.log(`规则         : ${fileState(src.rules)}`); console.log(`人设         : ${fileState(src.persona)}`); }
   console.log(`白名单 open_id: ${cfg.allowedOpenId}`);
+  console.log(`群聊讨论     : ${DISCUSS_ENABLED ? `${cfg.discussionHost ? '主持方' : '嘉宾'}，对方=${cfg.discussionPeer}，共享目录=${DISCUSS_DIR}` : '未启用（discussionDir / discussionPeer 未填）'}`);
   let ok = !!(lark && agentExe);
   if (lark) {
     const r = await runProcess(lark, ['auth', 'status'], { timeoutMs: 30000 });
@@ -1305,4 +1508,8 @@ if (process.argv.includes('--check')) {
   process.on('exit', releaseLock);
   if (cfg.allowGroups) fetchBotInfo();
   startConsumer();
+  if (DISCUSS_ENABLED) {
+    log('INFO', `讨论功能已启用：${cfg.discussionHost ? '主持方' : '嘉宾'}，对方=${cfg.discussionPeer}，共享目录=${DISCUSS_DIR}`);
+    setInterval(pollDiscussions, DISCUSS_POLL_MS);
+  }
 }

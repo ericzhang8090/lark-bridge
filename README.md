@@ -132,6 +132,27 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
    - `agent`、`botName`、`allowedOpenId`（新应用下你的 open_id 不一样，要重新取）
 4. 照常 `.\start.ps1 -Check` → `.\install-autostart.ps1` → `.\start-background.ps1`。
 
+## 让两个机器人在群里讨论
+
+两个实例都在同一台电脑上运行时，可以让它们在群里围绕一个话题轮流发言：
+
+> @小八 /讨论 3轮 远程办公和坐班哪个效率高
+
+- **为什么不靠互相 @**：飞书不一定会把一个机器人发的消息推送给另一个机器人，而且容易死循环。所以两个桥接程序在本机通过共享文件夹交接发言：每场讨论一个 `d-<消息ID>.json`，`next` 字段写着轮到谁；各自每 3 秒扫一次，轮到自己就生成发言、用自己的机器人身份发到群里，再把发言权交给对方。
+- **流程**：主持方收到 `/讨论` → 建记录、先发言 → 嘉宾回应 → …… 双方各说完 N 轮后，主持方做总结。默认发在发起消息下的话题里。
+- **只聊不动手**：讨论时两个 agent 都不给任何工具（Claude 用空的 `--tools`，agy 把所有命令放进 deny，Gemini 用不放行 shell 的策略），只输出文字，不会动你的数据，也不会把私人信息带进群。
+- **停止**：@ 任意一方发 `/stop`，本群所有进行中的讨论都会结束，正在生成的发言也会被中止。对方超过 `claudeTimeoutMinutes + 2` 分钟没发言（比如没在运行），主持方会在群里说明并结束。
+- **配置**（两个实例的 config.json）：
+
+  | 配置 | 主持方（如小八） | 嘉宾（如 GiGi） |
+  |---|---|---|
+  | `discussionDir` | 同一个共享文件夹 | 同一个共享文件夹 |
+  | `discussionPeer` | 对方的 `botName` | 对方的 `botName` |
+  | `discussionHost` | `true` | `false` |
+
+  可选：`discussionDefaultRounds`（默认 3）、`discussionMaxRounds`（默认 10）、`discussionInThread`（默认 true）。`discussionPeer` 必须和对方 config 里的 `botName` 完全一致。
+- **前提**：两个机器人都要被拉进这个群，且都开通了群消息相关权限。只需要 @ 主持方；嘉宾不处理 `/讨论` 命令。
+
 ## 注意事项
 
 - **open_id 按应用区分**：同一个人在不同机器人应用下的 open_id 不一样，换了应用就要重新取白名单 ID。
