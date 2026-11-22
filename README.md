@@ -46,6 +46,7 @@
 | `system-prompt.md` | 给 Claude 的工作规则（入库，随 `git pull` 更新） |
 | `persona.md` | 默认人设（"小八"） |
 | `persona.local.md` | 可选，不入库。存在时代替 `persona.md`，用来给本机机器人换人设；名字用 config.json 的 `botName`。规则和人设每条消息都会重新拼接，改完立即生效 |
+| `gemini-login.ps1` | `agent` 为 `gemini` 时用：在隔离的数据目录里登录一次 Gemini CLI |
 | `install-autostart.ps1` | 生成 `run-hidden.vbs`，并注册"登录时启动"计划任务（失败时改用"启动"文件夹）。加 `-Uninstall` 卸载 |
 | `start.ps1` / `start-background.ps1` / `stop.ps1` | 前台运行（加 `-Check` 只自检）/ 后台启动 / 停止 |
 
@@ -78,6 +79,35 @@ lark skills 文档放在 `%USERPROFILE%\.agents\skills`，可选，能让 Claude
 - 运行 `.\start.ps1 -Check`，确认 bot 身份是 ready、claude.exe 已找到。
 - 运行 `.\start.ps1`，然后给机器人发一条消息。日志里会出现 `忽略非白名单发送者 ou_xxx`，把这个值填进 `config.json` 的 `allowedOpenId`。
 - 再次运行 `.\start.ps1` 测试，通过后执行 `.\install-autostart.ps1` 和 `.\start-background.ps1`。
+
+## 换成 Gemini CLI（`agent: "gemini"`）
+
+config.json 里设 `"agent": "gemini"`，桥接就改用 Google 的 Gemini CLI，其余功能（排队、回执、引用、附件、进度、/q、/stop）不变。
+
+```powershell
+npm i -g @google/gemini-cli
+.\gemini-login.ps1            # 登录一次 Google 账号；也可以改为设置用户环境变量 GEMINI_API_KEY
+.\start.ps1 -Check            # 确认 gemini.js 已找到、显示"gemini 登录：已配置"
+```
+
+- **调用方式**：`node gemini.js --output-format stream-json --approval-mode default --policy <策略> --skip-trust [--model] [--resume <会话ID>] [--include-directories <skills>]`，prompt 从 stdin 传入。
+- **隔离**：`GEMINI_CLI_HOME` 指向 `state/gemini-home`，登录凭据、会话记录都放在这里，不读你自己 `~/.gemini` 里的设置、MCP 服务器和扩展。
+- **权限**：每次调用前生成 `state/gemini-home/bridge-policy.toml`，shell 只允许 `lark-cli`，写文件、web_fetch、MCP 一律拒绝；无头模式下其他需要确认的操作也会被拒绝。策略文件加载失败时桥接直接报错，不采用结果。
+- **系统提示词**：同样由 `system-prompt.md` + 人设拼成，写进 `state/gemini-home/.gemini/GEMINI.md`，追加在 Gemini 自带的提示词后面。
+- **模型**：`geminiModel` 留空用 Gemini 默认（auto）；`/q` 默认用 `flash`。Gemini 不返回费用，日志里记录 token 数。
+- **入口路径**：自动查找 `%APPDATA%\npm\node_modules\@google\gemini-cli\bundle\gemini.js`，找不到时在 config.json 里填 `geminiScript`。
+
+## 在同一台电脑上再跑一个机器人
+
+每个实例要用**不同的飞书应用**（同一个应用同时跑两个长连接会互相抢消息）和**不同的目录**（锁文件、会话、日志都在程序目录里）。
+
+1. 在飞书开发者后台新建应用，按上面第 1 步配置。
+2. 给 lark-cli 添加第二个 profile：`lark-cli config init --name bot2`（不会覆盖原来的默认应用）。
+3. 把仓库再 clone 一份到另一个目录，`config.json` 里设：
+   - `larkProfile`：`"bot2"`。桥接自己和 agent 调用的 lark-cli 都会用这个应用（通过环境变量 `LARKSUITE_CLI_PROFILE`）
+   - `instanceName`：比如 `"gemini"`。`install-autostart.ps1` 会注册成 `LarkClaudeBridge-gemini`，不会覆盖第一个实例的自启
+   - `agent`、`botName`、`allowedOpenId`（新应用下你的 open_id 不一样，要重新取）
+4. 照常 `.\start.ps1 -Check` → `.\install-autostart.ps1` → `.\start-background.ps1`。
 
 ## 注意事项
 

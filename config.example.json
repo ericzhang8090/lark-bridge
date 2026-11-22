@@ -1,10 +1,16 @@
 {
   "allowedOpenId": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 
+  "instanceName": "",
+  "larkProfile": "",
+  "agent": "claude",
+
   "larkCliExe": "",
   "claudeExe": "",
+  "geminiScript": "",
   "skillsDir": "",
   "claudeModel": "",
+  "geminiModel": "",
 
   "claudeTimeoutMinutes": 10,
   "ackText": "行吧，小八这就去弄",
@@ -24,7 +30,7 @@
 
   "progressAfterSeconds": 60,
   "progressIntervalSeconds": 60,
-  "quickModel": "haiku",
+  "quickModel": "",
   "downloadAttachments": true,
   "maxAttachmentMB": 20,
 

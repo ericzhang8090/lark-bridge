@@ -5,10 +5,17 @@ param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
 
 $root     = $PSScriptRoot
-$taskName = 'LarkClaudeBridge'
+# 同一台电脑跑多个实例时，在各自 config.json 里设不同的 instanceName，计划任务就不会互相覆盖
+$instance = ''
+$cfgFile  = Join-Path $root 'config.json'
+if (Test-Path $cfgFile) {
+    try { $instance = [string](Get-Content $cfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).instanceName } catch {}
+}
+$instance = ($instance -replace '[^A-Za-z0-9_-]', '')
+$taskName = if ($instance) { "LarkClaudeBridge-$instance" } else { 'LarkClaudeBridge' }
 $vbs      = Join-Path $root 'run-hidden.vbs'
 $startup  = [Environment]::GetFolderPath('Startup')
-$lnk      = Join-Path $startup 'LarkClaudeBridge.lnk'
+$lnk      = Join-Path $startup "$taskName.lnk"
 $user     = "$env:USERDOMAIN\$env:USERNAME"
 
 if ($Uninstall) {

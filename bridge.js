@@ -26,6 +26,9 @@ const LOG_DIR = path.join(ROOT, 'logs');
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const LOCK_FILE = path.join(STATE_DIR, 'bridge.lock');
+// agent=gemini 时作为 GEMINI_CLI_HOME：登录凭据、会话记录、策略都在这里，和你自己用的 ~/.gemini 隔离
+const GEMINI_HOME = path.join(STATE_DIR, 'gemini-home');
+const GEMINI_REL = path.join('node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
 const EVENT_KEY = 'im.message.receive_v1';
 const LARK_REL = path.join('node_modules', '@larksuite', 'cli', 'bin', 'lark-cli.exe');
 
@@ -34,8 +37,13 @@ for (const d of [WORK_DIR, OUTBOX_DIR, INBOX_DIR, LOG_DIR, STATE_DIR]) fs.mkdirS
 // ---------- 配置 ----------
 const DEFAULTS = {
   allowedOpenId: '',
+  instanceName: '', // 同一台电脑跑多个实例时用来区分（开机自启的计划任务名）
+  larkProfile: '', // lark-cli 的 profile（多个飞书应用时用 lark-cli config init --name 创建）；留空用默认
+  agent: 'claude', // 用哪个 CLI agent：claude | gemini
   larkCliExe: '',
   claudeExe: '',
+  geminiScript: '', // gemini-cli 入口 js（@google/gemini-cli 包里的 bundle/gemini.js）；留空自动查找
+  geminiModel: '',
   skillsDir: '',
   claudeModel: '',
   claudeTimeoutMinutes: 10,
@@ -53,7 +61,7 @@ const DEFAULTS = {
   alertAfterFailures: 3, // 订阅连续失败多少次后私聊告警，0 = 不告警
   progressAfterSeconds: 60, // 任务超过这么多秒还没完成，就发一条进度消息，0 = 不发
   progressIntervalSeconds: 60, // 之后每隔多少秒原地更新一次进度消息，0 = 只发一次
-  quickModel: 'haiku', // "/q 问题" 快速模式使用的模型
+  quickModel: '', // "/q 问题" 快速模式使用的模型；留空时 claude 用 haiku，gemini 用 flash
   downloadAttachments: true, // 自动下载消息（含被引用消息）里的图片和文件交给 Claude
   maxAttachmentMB: 20, // 单个附件超过这个大小就不交给 Claude
   botName: '小八', // 机器人名字，用在进度消息和告警里
@@ -70,6 +78,12 @@ const userCfg = readJson(path.join(ROOT, 'config.json'), {});
 const cfg = Object.assign({}, DEFAULTS, userCfg);
 if (userCfg.ackEmoji === undefined && userCfg.groupAckEmoji !== undefined) cfg.ackEmoji = userCfg.groupAckEmoji; // 旧配置名
 cfg.maxConcurrent = Math.max(1, Number(cfg.maxConcurrent) || 1);
+cfg.agent = String(cfg.agent || 'claude').toLowerCase();
+if (!['claude', 'gemini'].includes(cfg.agent)) {
+  console.error(`config.json 里的 agent 只能是 claude 或 gemini，当前是 ${cfg.agent}`);
+  process.exit(3);
+}
+if (!cfg.quickModel) cfg.quickModel = cfg.agent === 'gemini' ? 'flash' : 'haiku';
 // 系统提示词 = system-prompt.md（规则，入库）+ 人设。人设优先用不入库的 persona.local.md，
 // 没有再用 persona.md。这样规则随 git pull 更新，本机人设不会冲突。
 // 兼容：config.systemPromptFile 或 system-prompt.local.md 存在时，直接用它完整替换。
@@ -173,6 +187,19 @@ function resolveClaude() {
   return null;
 }
 
+function resolveGemini() {
+  if (cfg.geminiScript) return fs.existsSync(cfg.geminiScript) ? cfg.geminiScript : null;
+  return firstExisting([
+    path.join(process.env.APPDATA || '', 'npm', GEMINI_REL),
+    ...otherUserHomes().map((h) => path.join(h, 'AppData', 'Roaming', 'npm', GEMINI_REL)),
+  ]);
+}
+
+// 当前 agent 的可执行文件说明，用于启动日志和自检
+function agentExeLabel() {
+  return cfg.agent === 'gemini' ? resolveGemini() : resolveClaude();
+}
+
 function resolveSkillsDir() {
   if (cfg.skillsDir) return fs.existsSync(cfg.skillsDir) ? cfg.skillsDir : null;
   const hit = firstExisting([os.homedir(), ...otherUserHomes()].map((h) => path.join(h, '.agents', 'skills', 'lark-shared')));
@@ -192,6 +219,9 @@ function childEnv() {
   }
   extra.push(path.dirname(process.execPath));
   env[key] = [...extra, env[key] || ''].join(';');
+  // 桥接自己和 agent 调用的 lark-cli 都用这个 profile（lark-cli 识别 LARKSUITE_CLI_PROFILE）
+  if (cfg.larkProfile) env.LARKSUITE_CLI_PROFILE = cfg.larkProfile;
+  if (cfg.agent === 'gemini') env.GEMINI_CLI_HOME = GEMINI_HOME;
   return env;
 }
 
@@ -447,12 +477,12 @@ function parseJsonOutput(stdout) {
   return obj && typeof obj === 'object' ? obj : null;
 }
 
-// 把一次工具调用概括成一句话，用于进度消息和 /status
+// 把一次工具调用概括成一句话，用于进度消息和 /status（同时认 Claude 和 Gemini 的工具名）
 function describeTool(t) {
   const i = t.input || {};
-  if (t.name === 'PowerShell' || t.name === 'Bash') return preview(i.description || i.command, 80);
-  if (t.name === 'Read') return `读取 ${path.basename(String(i.file_path || ''))}`;
-  if (t.name === 'Glob' || t.name === 'Grep') return `查找 ${preview(i.pattern, 60)}`;
+  if (['PowerShell', 'Bash', 'run_shell_command'].includes(t.name)) return preview(i.description || i.command, 80);
+  if (t.name === 'Read' || t.name === 'read_file') return `读取 ${path.basename(String(i.file_path || i.absolute_path || i.path || ''))}`;
+  if (['Glob', 'Grep', 'glob', 'grep_search'].includes(t.name)) return `查找 ${preview(i.pattern, 60)}`;
   return t.name;
 }
 
@@ -527,6 +557,126 @@ async function runClaude(prompt, sessionId, ctl = {}, opts = {}) {
   }
   return { ok: false, resumeFailed, text: `处理出错（exit ${r.code}）：\n${(r.stderr || r.stdout).trim().slice(-800)}` };
 }
+
+// ---------- 调用 Gemini CLI ----------
+// Gemini 没有 --restricted / --tools 这类参数，用三样东西达到和 Claude 一样的限制：
+//   1. GEMINI_CLI_HOME 指向 state/gemini-home：不加载你自己 ~/.gemini 里的 MCP 服务器、扩展和设置
+//   2. --policy 策略文件：shell 只允许 lark-cli，写文件、联网抓取、MCP 一律拒绝（无头模式下需要确认的操作本来也会被拒绝）
+//   3. 系统提示词写进 gemini-home/.gemini/GEMINI.md（全局上下文文件，追加在 Gemini 自带提示词后面）
+const GEMINI_POLICY = `# 由 bridge.js 每次调用前生成，手动修改会被覆盖
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = ["lark-cli", "lark-cli.cmd", "lark-cli.exe"]
+decision = "allow"
+priority = 900
+
+[[rule]]
+toolName = "run_shell_command"
+decision = "deny"
+priority = 800
+
+[[rule]]
+toolName = ["write_file", "replace", "web_fetch", "save_memory", "activate_skill"]
+decision = "deny"
+priority = 800
+
+[[rule]]
+toolName = "*"
+mcpName = "*"
+decision = "deny"
+priority = 800
+`;
+
+function prepareGeminiHome() {
+  const dotDir = path.join(GEMINI_HOME, '.gemini');
+  fs.mkdirSync(dotDir, { recursive: true });
+  const policyFile = path.join(GEMINI_HOME, 'bridge-policy.toml');
+  fs.writeFileSync(policyFile, GEMINI_POLICY, 'utf8');
+  fs.copyFileSync(systemPromptFile(), path.join(dotDir, 'GEMINI.md'));
+  return policyFile;
+}
+
+function onGeminiLine(line, ctl, acc) {
+  if (!line.startsWith('{')) return;
+  let m;
+  try { m = JSON.parse(line); } catch { return; }
+  if (m.type === 'init') acc.sessionId = m.session_id || acc.sessionId;
+  else if (m.type === 'message' && m.role === 'assistant') acc.text += String(m.content || '');
+  else if (m.type === 'tool_use') {
+    // 和 Claude 的 result 一样只保留最后一段回答：调用工具前说的话（"我先查一下…"）不要
+    if (acc.text.trim()) acc.preToolText = acc.text;
+    acc.text = '';
+    ctl.steps = (ctl.steps || 0) + 1;
+    ctl.lastStep = describeTool({ name: m.tool_name, input: m.parameters });
+  } else if (m.type === 'error') acc.errors.push(String(m.message || ''));
+  else if (m.type === 'result') acc.result = m;
+}
+
+async function runGemini(prompt, sessionId, ctl = {}, opts = {}) {
+  const script = resolveGemini();
+  if (!script) return { ok: false, text: '找不到 Gemini CLI，请先运行 npm install -g @google/gemini-cli，或在 config.json 里设置 geminiScript。' };
+  const policyFile = prepareGeminiHome();
+  const skills = resolveSkillsDir();
+  const args = [
+    script,
+    '--output-format', 'stream-json',
+    '--approval-mode', 'default', // 需要确认的操作在无头模式下一律拒绝
+    '--policy', policyFile,
+    '--skip-trust', // work 目录不在信任列表里，跳过信任检查
+  ];
+  const model = opts.model || cfg.geminiModel;
+  if (model) args.push('--model', model);
+  if (sessionId) args.push('--resume', sessionId);
+  if (skills) args.push('--include-directories', skills); // 只读 lark skills 文档（写文件已被策略拒绝）
+
+  const t0 = Date.now();
+  const decoder = new StringDecoder('utf8');
+  const acc = { sessionId: null, text: '', preToolText: '', errors: [], result: null };
+  let buf = '';
+  // 提示词走 stdin：非终端输入时 Gemini 自动进入无头模式
+  const r = await runProcess(process.execPath, args, {
+    input: prompt, timeoutMs: cfg.claudeTimeoutMinutes * 60000, onSpawn: (c) => { ctl.child = c; },
+    onStdout: (b) => {
+      buf += decoder.write(b);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { onGeminiLine(buf.slice(0, i).trim(), ctl, acc); buf = buf.slice(i + 1); }
+    },
+  });
+  if (buf.trim()) onGeminiLine(buf.trim(), ctl, acc);
+  ctl.child = null;
+  const secs = Math.round((Date.now() - t0) / 1000);
+  if (ctl.stopped) {
+    log('INFO', `gemini 被 /stop 中止 (${secs}s)`);
+    return { ok: false, stopped: true };
+  }
+  if (r.timedOut) {
+    log('WARN', `gemini 超时 (${secs}s)`);
+    return { ok: false, text: `⏱ 任务超过 ${cfg.claudeTimeoutMinutes} 分钟没有完成，已中止。` };
+  }
+  // 策略文件写错时 Gemini 只打警告、照样运行（限制全部失效），必须当成失败
+  if (/Policy file error/i.test(r.stderr)) {
+    log('ERROR', `gemini 策略文件无效：${preview(r.stderr, 400)}`);
+    return { ok: false, text: 'Gemini 的权限策略文件加载失败，为安全起见本次结果不采用，请查看桥接日志。' };
+  }
+  const res = acc.result;
+  const errMsg = (res && res.error && res.error.message) || acc.errors.filter(Boolean).pop() || '';
+  const raw = `${r.stderr}\n${errMsg}`;
+  const resumeFailed = !!sessionId && /Invalid session identifier|No previous sessions found/i.test(raw);
+  const stats = (res && res.stats) || {};
+  log('INFO', `gemini 结束 exit=${r.code} ${secs}s status=${res && res.status} tokens=${stats.total_tokens ?? '?'}（输入 ${stats.input_tokens ?? '?'} / 输出 ${stats.output_tokens ?? '?'}）`);
+  if (resumeFailed) return { ok: false, resumeFailed, text: errMsg };
+  const text = (acc.text.trim() || acc.preToolText.trim());
+  if (res && res.status === 'success') {
+    return { ok: true, secs, cost: null, tokens: stats.total_tokens, sessionId: acc.sessionId || sessionId, text: text || '（任务已完成，没有文字输出）' };
+  }
+  const detail = errMsg || (r.stderr || r.stdout).trim().slice(-800);
+  if (/Auth method|GEMINI_API_KEY/i.test(detail)) {
+    return { ok: false, text: 'Gemini 还没登录：请在桥接目录运行 .\\gemini-login.ps1 登录一次，或设置环境变量 GEMINI_API_KEY 后重启桥接。' };
+  }
+  return { ok: false, sessionId: acc.sessionId || sessionId, text: `处理出错（exit ${r.code}）：\n${detail}` };
+}
+
+const runAgent = cfg.agent === 'gemini' ? runGemini : runClaude;
 
 // ---------- 消息处理 ----------
 const startedAt = Date.now();
@@ -801,12 +951,12 @@ async function runTask(ev, c, ackRid) {
     const prompt = buildPrompt(ev, quoted, attachments);
     let res;
     if (ctl.stopped) res = { stopped: true };
-    else if (ev.quick) res = await runClaude(prompt, null, ctl, { model: cfg.quickModel }); // 快速模式：独立会话，不保存
-    else res = await runClaude(prompt, getSession(ev.chat_id), ctl);
+    else if (ev.quick) res = await runAgent(prompt, null, ctl, { model: cfg.quickModel }); // 快速模式：独立会话，不保存
+    else res = await runAgent(prompt, getSession(ev.chat_id), ctl);
     if (res.resumeFailed && !ctl.stopped) {
       log('WARN', '恢复会话失败，改用新会话重试');
       setSession(ev.chat_id, null);
-      res = await runClaude(prompt, null, ctl);
+      res = await runAgent(prompt, null, ctl);
     }
     if (res.stopped || ctl.stopped) {
       await finishProgress(`⏹ 已停止（${summary()}）`);
@@ -814,7 +964,11 @@ async function runTask(ev, c, ackRid) {
       return;
     }
     await finishProgress(res.ok ? `✅ 做完了（${summary()}），结果见下一条` : `❌ 出错了（${summary()}）`);
-    if (ev.quick) {
+    if (res.cost === null) {
+      // Gemini 不返回费用（token 数已在 gemini 结束日志里）
+      log('INFO', `任务 ${id}${ev.quick ? `（/q ${cfg.quickModel}）` : ''} 用时 ${res.secs}s`);
+      if (!ev.quick && res.sessionId && epoch === c.epoch) setSession(ev.chat_id, res.sessionId, 0);
+    } else if (ev.quick) {
       log('INFO', `任务 ${id}（/q ${cfg.quickModel}）用时 ${res.secs}s，花费 $${(res.cost || 0).toFixed(2)}`);
     } else if (res.sessionId) {
       // total_cost_usd 是会话累计值，减去上次记录的累计值得到本次消耗
@@ -972,12 +1126,16 @@ function shutdown(sig) {
 // ---------- 自检 ----------
 async function check() {
   const lark = resolveLark();
-  const claude = resolveClaude();
+  const agentExe = agentExeLabel();
   const skills = resolveSkillsDir();
   console.log(`运行账户     : ${os.userInfo().username}`);
+  console.log(`实例名       : ${cfg.instanceName || '（默认）'}`);
   console.log(`node         : ${process.execPath} (${process.version})`);
   console.log(`lark-cli.exe : ${lark || '未找到'}`);
-  console.log(`claude.exe   : ${claude || '未找到'}`);
+  console.log(`lark profile : ${cfg.larkProfile || '（默认）'}`);
+  console.log(`agent        : ${cfg.agent}`);
+  console.log(`${cfg.agent === 'gemini' ? 'gemini.js   ' : 'claude.exe  '} : ${agentExe || '未找到'}`);
+  if (cfg.agent === 'gemini') console.log(`gemini 数据  : ${GEMINI_HOME}`);
   console.log(`lark skills  : ${skills || '未找到（不影响运行）'}`);
   console.log(`机器人名字   : ${cfg.botName}`);
   const src = promptSources();
@@ -985,7 +1143,7 @@ async function check() {
   if (src.full) console.log(`系统提示词   : ${fileState(src.full)}（完整替换）`);
   else { console.log(`规则         : ${fileState(src.rules)}`); console.log(`人设         : ${fileState(src.persona)}`); }
   console.log(`白名单 open_id: ${cfg.allowedOpenId}`);
-  let ok = !!(lark && claude);
+  let ok = !!(lark && agentExe);
   if (lark) {
     const r = await runProcess(lark, ['auth', 'status'], { timeoutMs: 30000 });
     const j = parseJsonOutput(r.stdout) || parseJsonOutput(r.stderr) || {};
@@ -996,8 +1154,14 @@ async function check() {
     if (!bot || !bot.available) ok = false;
     if (cfg.allowGroups) console.log(`机器人 open_id: ${(await fetchBotInfo()) || '获取失败（群聊 @ 将不可用）'}`);
   }
-  if (claude) {
-    const r = await runProcess(claude, ['--version'], { timeoutMs: 30000 });
+  if (agentExe && cfg.agent === 'gemini') {
+    const r = await runProcess(process.execPath, [agentExe, '--version'], { timeoutMs: 30000 });
+    console.log(`gemini 版本  : ${(r.stdout || r.stderr).trim()}`);
+    const authed = !!process.env.GEMINI_API_KEY || fs.existsSync(path.join(GEMINI_HOME, '.gemini', 'oauth_creds.json'));
+    console.log(`gemini 登录  : ${authed ? '已配置' : '未登录 —— 运行 .\\gemini-login.ps1，或设置环境变量 GEMINI_API_KEY'}`);
+    if (!authed) ok = false;
+  } else if (agentExe) {
+    const r = await runProcess(agentExe, ['--version'], { timeoutMs: 30000 });
     console.log(`claude 版本  : ${(r.stdout || r.stderr).trim()}`);
   }
   console.log(ok ? '\n自检通过' : '\n自检未通过，请按上面的提示修复');
@@ -1012,7 +1176,7 @@ if (process.argv.includes('--check')) {
   check().then((c) => process.exit(c));
 } else {
   acquireLock();
-  log('INFO', `桥接启动 pid=${process.pid} 用户=${os.userInfo().username} lark=${resolveLark()} claude=${resolveClaude()}`);
+  log('INFO', `桥接启动 pid=${process.pid} 用户=${os.userInfo().username} lark=${resolveLark()} profile=${cfg.larkProfile || '默认'} agent=${cfg.agent} ${agentExeLabel()}`);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => shutdown(sig));
   process.on('exit', releaseLock);
   if (cfg.allowGroups) fetchBotInfo();
