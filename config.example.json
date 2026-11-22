@@ -45,5 +45,6 @@
   "discussionPeerAliases": [],
   "discussionDefaultRounds": 3,
   "discussionMaxRounds": 10,
-  "discussionInThread": true
+  "discussionInThread": true,
+  "discussionContextMessages": 30
 }
