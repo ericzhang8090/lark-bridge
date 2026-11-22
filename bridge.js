@@ -71,6 +71,7 @@ const DEFAULTS = {
   // 群聊讨论（两个机器人轮流发言）：两个实例填同一个 discussionDir，各自填对方的名字
   discussionDir: '', // 共享文件夹，放讨论记录；留空 = 不启用讨论
   discussionPeer: '', // 对方机器人的名字（对方 config 里的 botName）
+  discussionPeerAliases: [], // 对方在飞书里的显示名（@ 时的名字），用来识别"同时 @ 了两个机器人"；不区分大小写、包含即可
   discussionHost: false, // 是否由本机器人主持（接收 /讨论 命令、先发言、做总结）；两个实例里只开一个
   discussionDefaultRounds: 3,
   discussionMaxRounds: 10,
@@ -1229,7 +1230,17 @@ function updateDiscussion(id, fn) {
   return d;
 }
 
-// "/讨论 3轮 话题" 或 "/讨论 话题"
+// 消息里是否 @ 了对方机器人（按显示名匹配）
+function mentionsPeer(ev) {
+  const names = [cfg.discussionPeer, ...(cfg.discussionPeerAliases || [])].filter(Boolean).map((n) => String(n).toLowerCase());
+  return (ev.mentions || []).some((m) => m && m.id !== botOpenId && m.name
+    && names.some((n) => m.name.toLowerCase().includes(n)));
+}
+
+// 两种发起方式：
+//   1. 命令："/讨论 3轮 话题" 或 "/讨论 话题"
+//   2. 自然说法：同时 @ 两个机器人，话里带"讨论 / 辩论 / 商量 / 聊聊"，轮数可写"3轮"
+// 嘉宾收到同样的消息时也会识别出来，但只忽略（不当普通任务回答），由主持方发起
 function parseDiscussCommand(ev) {
   if (!DISCUSS_ENABLED || ev.chat_type !== 'group') return null;
   let t = ev.text;
@@ -1238,10 +1249,14 @@ function parseDiscussCommand(ev) {
     if (m && m.key) t = t.split(m.key).join(' ');
   }
   t = t.replace(/\s+/g, ' ').trim();
+  const clamp = (n) => Math.min(Math.max(Number(n) || cfg.discussionDefaultRounds, 1), cfg.discussionMaxRounds);
   const m = /^\/(?:讨论|discuss)(?:\s+(\d+)\s*轮?)?\s+([\s\S]+)$/i.exec(t);
-  if (!m) return null;
-  const rounds = Math.min(Math.max(Number(m[1]) || cfg.discussionDefaultRounds, 1), cfg.discussionMaxRounds);
-  return { rounds, topic: m[2].trim() };
+  if (m) return { rounds: clamp(m[1]), topic: m[2].trim() };
+  if (mentionsPeer(ev) && /讨论|辩论|商量|聊聊|debate|discuss/i.test(t)) {
+    const r = /(\d+)\s*轮/.exec(t);
+    return { rounds: clamp(r && r[1]), topic: t };
+  }
+  return null;
 }
 
 async function startDiscussion(ev, cmd) {
