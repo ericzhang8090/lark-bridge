@@ -13,6 +13,9 @@
   "geminiModel": "",
   "agyExe": "",
   "agyModel": "",
+  "codexExe": "",
+  "codexModel": "",
+  "codexEffort": "medium",
 
   "claudeTimeoutMinutes": 10,
   "ackText": "行吧，小八这就去弄",

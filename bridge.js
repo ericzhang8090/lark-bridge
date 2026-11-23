@@ -29,6 +29,9 @@ const LOCK_FILE = path.join(STATE_DIR, 'bridge.lock');
 // agent=gemini 时作为 GEMINI_CLI_HOME：登录凭据、会话记录、策略都在这里，和你自己用的 ~/.gemini 隔离
 const GEMINI_HOME = path.join(STATE_DIR, 'gemini-home');
 const GEMINI_REL = path.join('node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
+// agent=codex 时作为 CODEX_HOME：登录凭据、会话记录都在这里，和你自己的 Codex 桌面应用（~/.codex）隔离
+const CODEX_HOME = path.join(STATE_DIR, 'codex-home');
+const LARK_MCP_SCRIPT = path.join(ROOT, 'lark-mcp.js');
 const EVENT_KEY = 'im.message.receive_v1';
 const LARK_REL = path.join('node_modules', '@larksuite', 'cli', 'bin', 'lark-cli.exe');
 
@@ -39,13 +42,16 @@ const DEFAULTS = {
   allowedOpenId: '',
   instanceName: '', // 同一台电脑跑多个实例时用来区分（开机自启的计划任务名）
   larkProfile: '', // lark-cli 的 profile（多个飞书应用时用 lark-cli config init --name 创建）；留空用默认
-  agent: 'claude', // 用哪个 CLI agent：claude | gemini | agy（Antigravity CLI）
+  agent: 'claude', // 用哪个 CLI agent：claude | gemini | agy（Antigravity CLI）| codex（OpenAI Codex）
   larkCliExe: '',
   claudeExe: '',
   geminiScript: '', // gemini-cli 入口 js（@google/gemini-cli 包里的 bundle/gemini.js）；留空自动查找
   geminiModel: '',
   agyExe: '', // Antigravity CLI 的 agy.exe；留空自动查找（%LOCALAPPDATA%\agy\bin、PATH）
   agyModel: '', // 留空用 agy 默认模型；可选值用 agy models 查看
+  codexExe: '', // codex.exe；留空自动查找（Codex 桌面应用自带的 %LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe、PATH）
+  codexModel: '', // 留空用 Codex 默认模型
+  codexEffort: 'medium', // 推理强度：low | medium | high | xhigh
   skillsDir: '',
   claudeModel: '',
   claudeTimeoutMinutes: 10,
@@ -90,11 +96,12 @@ const cfg = Object.assign({}, DEFAULTS, userCfg);
 if (userCfg.ackEmoji === undefined && userCfg.groupAckEmoji !== undefined) cfg.ackEmoji = userCfg.groupAckEmoji; // 旧配置名
 cfg.maxConcurrent = Math.max(1, Number(cfg.maxConcurrent) || 1);
 cfg.agent = String(cfg.agent || 'claude').toLowerCase();
-if (!['claude', 'gemini', 'agy'].includes(cfg.agent)) {
-  console.error(`config.json 里的 agent 只能是 claude、gemini 或 agy，当前是 ${cfg.agent}`);
+if (!['claude', 'gemini', 'agy', 'codex'].includes(cfg.agent)) {
+  console.error(`config.json 里的 agent 只能是 claude、gemini、agy 或 codex，当前是 ${cfg.agent}`);
   process.exit(3);
 }
-if (!cfg.quickModel) cfg.quickModel = { claude: 'haiku', gemini: 'flash', agy: 'gemini-3.8-flash-low' }[cfg.agent];
+// codex 的 /q 快速模式不换模型（用 ChatGPT 账号时可用的模型名不固定），只把推理强度降到 low
+if (!cfg.quickModel) cfg.quickModel = { claude: 'haiku', gemini: 'flash', agy: 'gemini-3.8-flash-low', codex: '' }[cfg.agent];
 // 系统提示词 = system-prompt.md（规则，入库）+ 人设。人设优先用不入库的 persona.local.md，
 // 没有再用 persona.md。这样规则随 git pull 更新，本机人设不会冲突。
 // 兼容：config.systemPromptFile 或 system-prompt.local.md 存在时，直接用它完整替换。
@@ -218,9 +225,26 @@ function resolveAgy() {
   return null;
 }
 
+function resolveCodex() {
+  if (cfg.codexExe) return fs.existsSync(cfg.codexExe) ? cfg.codexExe : null;
+  // Codex 桌面应用把 CLI 放在 %LOCALAPPDATA%\OpenAI\Codex\bin\<版本哈希>\codex.exe，更新后目录会变，取最新的
+  const base = path.join(process.env.LOCALAPPDATA || '', 'OpenAI', 'Codex', 'bin');
+  try {
+    const found = fs.readdirSync(base).map((n) => path.join(base, n, 'codex.exe')).filter((p) => fs.existsSync(p))
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    if (found[0]) return found[0];
+  } catch { /* ignore */ }
+  const w = spawnSync('where.exe', ['codex.exe'], { encoding: 'utf8', windowsHide: true });
+  if (w.status === 0) {
+    const p = w.stdout.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (p) return p;
+  }
+  return null;
+}
+
 // 当前 agent 的可执行文件，用于启动日志和自检
 function agentExeLabel() {
-  return { claude: resolveClaude, gemini: resolveGemini, agy: resolveAgy }[cfg.agent]();
+  return { claude: resolveClaude, gemini: resolveGemini, agy: resolveAgy, codex: resolveCodex }[cfg.agent]();
 }
 
 function resolveSkillsDir() {
@@ -245,6 +269,11 @@ function childEnv() {
   // 桥接自己和 agent 调用的 lark-cli 都用这个 profile（lark-cli 识别 LARKSUITE_CLI_PROFILE）
   if (cfg.larkProfile) env.LARKSUITE_CLI_PROFILE = cfg.larkProfile;
   if (cfg.agent === 'gemini') env.GEMINI_CLI_HOME = GEMINI_HOME;
+  if (cfg.agent === 'codex') {
+    env.CODEX_HOME = CODEX_HOME;
+    if (lark) env.LARK_CLI_EXE = lark; // 给 lark-mcp.js 用
+    env.LARK_MCP_CWD = WORK_DIR;
+  }
   return env;
 }
 
@@ -504,6 +533,7 @@ function parseJsonOutput(stdout) {
 function describeTool(t) {
   const i = t.input || {};
   if (['PowerShell', 'Bash', 'run_shell_command', 'run_command'].includes(t.name)) return preview(i.description || i.command || i.CommandLine, 80);
+  if (t.name === 'lark_cli' && Array.isArray(i.args)) return preview(`lark-cli ${i.args.join(' ')}`, 80);
   if (['Read', 'read_file', 'view_file'].includes(t.name)) return `读取 ${path.basename(String(i.file_path || i.absolute_path || i.path || i.AbsolutePath || i.Path || ''))}`;
   if (['Glob', 'Grep', 'glob', 'grep_search'].includes(t.name)) return `查找 ${preview(i.pattern, 60)}`;
   return t.name;
@@ -817,7 +847,101 @@ async function runAgy(prompt, sessionId, ctl = {}, opts = {}) {
   return { ok: false, sessionId: sid, text: `处理出错（${res.status || `exit ${r.code}`}）：\n${detail}` };
 }
 
-const runAgent = { claude: runClaude, gemini: runGemini, agy: runAgy }[cfg.agent];
+// ---------- 调用 OpenAI Codex CLI ----------
+// 用 Codex 桌面应用自带的 codex.exe，ChatGPT 账号登录（订阅额度，不按 token 另付费）。
+// 限制方式：把 Codex 的 shell 整个关掉（shell_tool / unified_exec），只通过 lark-mcp.js 这个本地 MCP 工具
+// 调用 lark-cli —— 它用参数数组直接启动 lark-cli.exe，不经过 shell，没法拼接或嵌入其他命令。
+// 同时关掉 apps / plugins / 浏览器 / computer use，不加载你自己的 Codex 配置和规则；
+// CODEX_HOME 指向 state/codex-home，登录凭据和会话记录与 Codex 桌面应用隔离（需要用 codex-login.ps1 登录一次）。
+const CODEX_DISABLED_FEATURES = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'in_app_browser', 'computer_use'];
+const CODEX_RULES_NOTE = `
+
+# 调用 lark-cli 的方式（Codex）
+
+你没有 shell。要执行 lark-cli，调用 lark_cli 工具，把 lark-cli 后面的参数按顺序放进 args 数组，每个参数一项、不要加引号，例如 {"args": ["calendar", "+agenda", "--as", "user"]}。不支持管道、重定向和拼接命令；处理 JSON 用 lark-cli 自带的 --jq 参数。附件里的图片已经直接附在这条消息里；其他文件你读不了，如实说明。
+`;
+const tomlStr = (s) => `'${String(s).replace(/'/g, '')}'`; // TOML 字面量字符串（Windows 路径里的反斜杠不用转义）
+
+function onCodexLine(line, ctl, acc) {
+  if (!line.startsWith('{')) return;
+  let m;
+  try { m = JSON.parse(line); } catch { return; }
+  const it = m.item || {};
+  if (m.type === 'thread.started') acc.sessionId = m.thread_id || acc.sessionId;
+  else if (m.type === 'item.started' && it.type === 'mcp_tool_call') {
+    ctl.steps = (ctl.steps || 0) + 1;
+    ctl.lastStep = describeTool({ name: it.tool, input: it.arguments });
+  } else if (m.type === 'item.completed' && it.type === 'agent_message') acc.text = String(it.text || ''); // 只保留最后一段回答
+  else if (m.type === 'turn.completed') { acc.done = true; acc.usage = m.usage || {}; }
+  else if (m.type === 'turn.failed') acc.error = (m.error && m.error.message) || 'turn failed';
+  else if (m.type === 'error') acc.error = m.message || acc.error;
+}
+
+async function runCodex(prompt, sessionId, ctl = {}, opts = {}) {
+  const exe = resolveCodex();
+  if (!exe) return { ok: false, text: '找不到 codex.exe：请安装 Codex 桌面应用（自带命令行），或在 config.json 里设置 codexExe。' };
+  const src = fs.readFileSync(systemPromptFile(), 'utf8');
+  fs.writeFileSync(path.join(WORK_DIR, 'AGENTS.md'), src.trimEnd() + CODEX_RULES_NOTE, 'utf8');
+  fs.mkdirSync(CODEX_HOME, { recursive: true });
+  const common = [
+    '--json', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
+    '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"',
+    '-c', `model_reasoning_effort="${opts.quick ? 'low' : cfg.codexEffort || 'medium'}"`,
+    ...CODEX_DISABLED_FEATURES.flatMap((f) => ['--disable', f]),
+  ];
+  if (!opts.noTools) { // 讨论模式只聊不动手：连 lark_cli 工具也不给
+    common.push(
+      '-c', `mcp_servers.lark.command=${tomlStr(process.execPath)}`,
+      '-c', `mcp_servers.lark.args=[${tomlStr(LARK_MCP_SCRIPT)}]`,
+      '-c', 'mcp_servers.lark.env_vars=["LARK_CLI_EXE","LARK_MCP_CWD","LARKSUITE_CLI_PROFILE"]',
+      '-c', 'mcp_servers.lark.default_tools_approval_mode="approve"');
+  }
+  const model = opts.model || cfg.codexModel;
+  if (model) common.push('-m', model);
+  // 附件里的图片直接附给 Codex（它没有读文件的工具）
+  for (const p of [...new Set(prompt.match(/[A-Za-z]:\\[^\s`'"]*?\.(?:png|jpe?g|gif|webp)/gi) || [])]) {
+    if (p.startsWith(INBOX_DIR) && fs.existsSync(p)) common.push('-i', p);
+  }
+  const args = sessionId ? ['exec', 'resume', ...common, sessionId, '-'] : ['exec', ...common, '-'];
+
+  const t0 = Date.now();
+  const decoder = new StringDecoder('utf8');
+  const acc = { sessionId: null, text: '', error: '', done: false, usage: {} };
+  let buf = '';
+  const r = await runProcess(exe, args, {
+    input: prompt, timeoutMs: cfg.claudeTimeoutMinutes * 60000, onSpawn: (c) => { ctl.child = c; },
+    onStdout: (b) => {
+      buf += decoder.write(b);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { onCodexLine(buf.slice(0, i).trim(), ctl, acc); buf = buf.slice(i + 1); }
+    },
+  });
+  if (buf.trim()) onCodexLine(buf.trim(), ctl, acc);
+  ctl.child = null;
+  const secs = Math.round((Date.now() - t0) / 1000);
+  if (ctl.stopped) {
+    log('INFO', `codex 被 /stop 中止 (${secs}s)`);
+    return { ok: false, stopped: true };
+  }
+  if (r.timedOut) {
+    log('WARN', `codex 超时 (${secs}s)`);
+    return { ok: false, text: `⏱ 任务超过 ${cfg.claudeTimeoutMinutes} 分钟没有完成，已中止。` };
+  }
+  const u = acc.usage || {};
+  log('INFO', `codex 结束 exit=${r.code} ${secs}s done=${acc.done} tokens=输入 ${u.input_tokens ?? '?'}（缓存 ${u.cached_input_tokens ?? '?'}）/ 输出 ${u.output_tokens ?? '?'}${acc.error ? ` error=${preview(acc.error, 200)}` : ''}`);
+  const sid = acc.sessionId || sessionId;
+  if (acc.done && !acc.error) {
+    return { ok: true, secs, cost: null, sessionId: sid, text: acc.text.trim() || '（任务已完成，没有文字输出）' };
+  }
+  const detail = acc.error || (r.stderr || r.stdout).trim().slice(-800);
+  if (sessionId && /no rollout|not found|no session|找不到/i.test(detail)) return { ok: false, resumeFailed: true, text: detail };
+  if (/log ?in|login|auth|401|unauthori[sz]ed/i.test(detail)) {
+    return { ok: false, text: 'Codex 没有登录或登录已过期：请在桥接目录运行 .\\codex-login.ps1 用 ChatGPT 账号登录后再试。' };
+  }
+  return { ok: false, sessionId: sid, text: `处理出错（exit ${r.code}）：\n${detail}` };
+}
+
+const runAgent = { claude: runClaude, gemini: runGemini, agy: runAgy, codex: runCodex }[cfg.agent];
 
 // ---------- 消息处理 ----------
 const startedAt = Date.now();
@@ -1040,7 +1164,7 @@ async function runCommand(cmd, ev) {
     await sendReply(target, [
       '直接发任务即可（群里要 @我），我会用 lark-cli 帮你完成。可以发图片、文件，或引用回复某条消息。',
       '',
-      `- \`/q 问题\` 快速模式：用便宜的 ${cfg.quickModel} 模型、不带上下文，适合简单问题`,
+      `- \`/q 问题\` 快速模式：${cfg.quickModel ? `用便宜的 ${cfg.quickModel} 模型` : '用低推理强度'}、不带上下文，适合简单问题`,
       '- `/stop` 停止本聊天正在跑的任务，并取消排队的任务',
       '- `/new` 开启新会话（清空本聊天的上下文）',
       '- `/status` 查看运行状态',
@@ -1097,7 +1221,7 @@ async function runTask(ev, c, ackRid) {
     const prompt = buildPrompt(ev, quoted, attachments);
     let res;
     if (ctl.stopped) res = { stopped: true };
-    else if (ev.quick) res = await runAgent(prompt, null, ctl, { model: cfg.quickModel }); // 快速模式：独立会话，不保存
+    else if (ev.quick) res = await runAgent(prompt, null, ctl, { model: cfg.quickModel, quick: true }); // 快速模式：独立会话，不保存
     else res = await runAgent(prompt, getSession(ev.chat_id), ctl);
     if (res.resumeFailed && !ctl.stopped) {
       log('WARN', '恢复会话失败，改用新会话重试');
@@ -1528,7 +1652,8 @@ async function check() {
   console.log(`lark-cli.exe : ${lark || '未找到'}`);
   console.log(`lark profile : ${cfg.larkProfile || '（默认）'}`);
   console.log(`agent        : ${cfg.agent}`);
-  console.log(`${{ claude: 'claude.exe  ', gemini: 'gemini.js   ', agy: 'agy.exe     ' }[cfg.agent]} : ${agentExe || '未找到'}`);
+  console.log(`${{ claude: 'claude.exe  ', gemini: 'gemini.js   ', agy: 'agy.exe     ', codex: 'codex.exe   ' }[cfg.agent]} : ${agentExe || '未找到'}`);
+  if (cfg.agent === 'codex') console.log(`codex 数据   : ${CODEX_HOME}`);
   if (cfg.agent === 'gemini') console.log(`gemini 数据  : ${GEMINI_HOME}`);
   console.log(`lark skills  : ${skills || '未找到（不影响运行）'}`);
   console.log(`机器人名字   : ${cfg.botName}`);
@@ -1559,6 +1684,15 @@ async function check() {
     const r = await runProcess(agentExe, ['--version'], { timeoutMs: 30000 });
     console.log(`${cfg.agent} 版本${cfg.agent === 'agy' ? '   ' : ''}  : ${(r.stdout || r.stderr).trim()}`);
     if (cfg.agent === 'agy') console.log('agy 登录     : 用交互模式运行一次 agy 登录 Google 账号；凭据在 Windows 凭据管理器里，自检无法确认');
+    if (cfg.agent === 'codex') {
+      fs.mkdirSync(CODEX_HOME, { recursive: true });
+      const s = await runProcess(agentExe, ['login', 'status'], { timeoutMs: 30000 });
+      const txt = `${s.stdout}${s.stderr}`.trim();
+      const authed = s.code === 0 && /logged in/i.test(txt);
+      console.log(`codex 登录   : ${authed ? preview(txt, 60) : '未登录 —— 运行 .\\codex-login.ps1 用 ChatGPT 账号登录'}`);
+      if (!authed) ok = false;
+      if (!fs.existsSync(LARK_MCP_SCRIPT)) { console.log(`lark-mcp.js  : 缺少 ${LARK_MCP_SCRIPT}`); ok = false; }
+    }
   }
   console.log(ok ? '\n自检通过' : '\n自检未通过，请按上面的提示修复');
   return ok ? 0 : 1;

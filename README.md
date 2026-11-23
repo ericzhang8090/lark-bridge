@@ -46,6 +46,8 @@
 | `system-prompt.md` | 给 Claude 的工作规则（入库，随 `git pull` 更新） |
 | `persona.md` | 默认人设（"小八"） |
 | `persona.local.md` | 可选，不入库。存在时代替 `persona.md`，用来给本机机器人换人设；名字用 config.json 的 `botName`。规则和人设每条消息都会重新拼接，改完立即生效 |
+| `codex-login.ps1` | `agent` 为 `codex` 时用：在隔离的数据目录里用 ChatGPT 账号登录一次 Codex |
+| `lark-mcp.js` | `agent` 为 `codex` 时用：只提供 `lark_cli` 一个工具的本地 MCP 服务器 |
 | `gemini-login.ps1` | `agent` 为 `gemini` 时用：在隔离的数据目录里登录一次 Gemini CLI |
 | `install-autostart.ps1` | 生成 `run-hidden.vbs`，并注册"登录时启动"计划任务（失败时改用"启动"文件夹）。加 `-Uninstall` 卸载 |
 | `start.ps1` / `start-background.ps1` / `stop.ps1` | 前台运行（加 `-Check` 只自检）/ 后台启动 / 停止 |
@@ -119,6 +121,22 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
 - **系统提示词**：`system-prompt.md` + 人设写成 `work/AGENTS.md`（agy 读取工作目录里的 AGENTS.md）。
 - **模型**：`agyModel` 留空用 agy 默认；`/q` 默认用 `gemini-3.8-flash-low`。可选值用 `agy models` 查看。agy 不返回费用，日志里记录 token 数。
 - **登录**：凭据存在 Windows 凭据管理器里，自检无法确认是否已登录；过期时机器人会回复提示，重新交互运行一次 `agy` 登录即可。
+
+## 换成 OpenAI Codex（`agent: "codex"`）
+
+用 Codex 桌面应用自带的 `codex.exe`，ChatGPT 账号登录（订阅额度，不需要 API Key）。
+
+```powershell
+.\codex-login.ps1        # 用 ChatGPT 账号登录一次；凭据存在 state\codex-home，和 Codex 桌面应用分开
+.\start.ps1 -Check       # 确认 codex.exe 已找到、codex 登录显示 Logged in
+```
+
+- **调用方式**：`codex exec --json --ignore-user-config --ignore-rules -c sandbox_mode="read-only" -c approval_policy="never" --disable shell_tool --disable unified_exec ... -`，prompt 从 stdin 传入；续接对话用 `codex exec resume <thread_id> -`。
+- **权限**：Codex 在 Windows 上的规则文件不会拆开 PowerShell 包装（`powershell -Command '...'`），没法做到"只放行 lark-cli"。所以直接**关掉 shell**（`shell_tool`、`unified_exec`），另外关掉 apps、plugins、浏览器、computer use；只给它一个本地 MCP 工具 `lark_cli`（`lark-mcp.js`），用参数数组直接启动 `lark-cli.exe`，不经过 shell，参数里的 `; | & $` 都只是普通文本。这个工具设为自动批准。
+- **隔离**：`CODEX_HOME` 指向 `state/codex-home`，登录凭据和会话记录不会混进你的 Codex 桌面应用；`--ignore-user-config` / `--ignore-rules` 不加载任何个人配置。
+- **系统提示词**：写成 `work/AGENTS.md`。附件里的图片用 `-i` 直接附给 Codex；其他文件它读不了。
+- **模型**：`codexModel` 留空用默认；`codexEffort` 默认 `medium`，`/q` 快速模式用 `low`。
+- **入口路径**：自动查找 `%LOCALAPPDATA%\OpenAI\Codex\bin\<版本>\codex.exe`（桌面应用更新后目录会变，每次取最新的），找不到时在 config.json 里填 `codexExe`。
 
 ## 在同一台电脑上再跑一个机器人
 
