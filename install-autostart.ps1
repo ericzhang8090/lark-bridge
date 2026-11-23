@@ -1,4 +1,4 @@
-﻿# 注册"登录时自动后台启动"飞书桥接（针对当前 Windows 用户）
+﻿# 设置"登录时自动后台启动"飞书桥接（当前 Windows 用户的"启动"文件夹）
 #   .\install-autostart.ps1              安装
 #   .\install-autostart.ps1 -Uninstall   卸载
 param([switch]$Uninstall)
@@ -49,24 +49,14 @@ Loop
 [IO.File]::WriteAllText($vbs, $vbsContent, [Text.Encoding]::Unicode)
 Write-Host "已生成 $vbs"
 
-try {
-    $action    = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`"" -WorkingDirectory $root
-    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                   -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Host "已注册计划任务 $taskName（$user 登录时启动）"
-    if (Test-Path $lnk) { Remove-Item $lnk -Force }
-}
-catch {
-    Write-Warning "注册计划任务失败（$($_.Exception.Message)），改用启动文件夹快捷方式"
-    $ws = New-Object -ComObject WScript.Shell
-    $s = $ws.CreateShortcut($lnk)
-    $s.TargetPath = 'wscript.exe'
-    $s.Arguments = "`"$vbs`""
-    $s.WorkingDirectory = $root
-    $s.Save()
-    Write-Host "已创建启动项 $lnk"
-}
+# 用"启动"文件夹快捷方式自启（由资源管理器在正常登录环境里拉起）；旧版注册的计划任务顺带删掉
+try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop; Write-Host "已删除旧的计划任务 $taskName" } catch {}
+$ws = New-Object -ComObject WScript.Shell
+$s = $ws.CreateShortcut($lnk)
+$s.TargetPath = Join-Path $env:WINDIR 'System32\wscript.exe'
+$s.Arguments = "`"$vbs`""
+$s.WorkingDirectory = $root
+$s.WindowStyle = 7
+$s.Save()
+Write-Host "已创建启动项 $lnk（$user 登录时启动）"
 Write-Host "`n现在立即后台启动：.\start-background.ps1"

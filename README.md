@@ -49,7 +49,7 @@
 | `codex-login.ps1` | `agent` 为 `codex` 时用：在隔离的数据目录里用 ChatGPT 账号登录一次 Codex |
 | `lark-mcp.js` | `agent` 为 `codex` 时用：只提供 `lark_cli` 一个工具的本地 MCP 服务器 |
 | `gemini-login.ps1` | `agent` 为 `gemini` 时用：在隔离的数据目录里登录一次 Gemini CLI |
-| `install-autostart.ps1` | 生成 `run-hidden.vbs`，并注册"登录时启动"计划任务（失败时改用"启动"文件夹）。加 `-Uninstall` 卸载 |
+| `install-autostart.ps1` | 生成 `run-hidden.vbs`，并在"启动"文件夹放快捷方式，登录时自动后台启动。会顺带删掉旧版注册的计划任务。加 `-Uninstall` 卸载 |
 | `start.ps1` / `start-background.ps1` / `stop.ps1` | 前台运行（加 `-Check` 只自检）/ 后台启动 / 停止 |
 
 ## 在新账户或新设备上部署
@@ -73,6 +73,8 @@ lark-cli config init          # 绑定机器人应用（App Secret 存入当前�
 lark-cli auth login           # 可选：让 Claude 能用 --as user 以你本人身份操作
 irm https://claude.ai/install.ps1 | iex ; claude   # 安装 Claude Code 并登录
 ```
+> ⚠️ **`lark-cli auth login` 要在普通的 PowerShell 窗口里运行**（Win+R 输入 `powershell`），不要在 Claude 桌面应用、Codex 应用等 Microsoft Store 打包应用的内置终端里运行。新版 lark-cli 把用户登录密钥（DPoP）存在 TPM 里，打包应用里生成的密钥会被 Windows 隔离到该应用内部，桥接（以及其他程序）打不开，以用户身份的调用会报 `dpop_key_missing` / `Keyset does not exist`。在普通窗口生成的密钥则所有程序都能用。
+
 lark skills 文档放在 `%USERPROFILE%\.agents\skills`，可选，能让 Claude 更准确地使用 lark-cli。
 
 **3. 复制程序并配置**
@@ -146,7 +148,7 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
 2. 给 lark-cli 添加第二个 profile：`lark-cli config init --name bot2`（不会覆盖原来的默认应用）。
 3. 把仓库再 clone 一份到另一个目录，`config.json` 里设：
    - `larkProfile`：`"bot2"`。桥接自己和 agent 调用的 lark-cli 都会用这个应用（通过环境变量 `LARKSUITE_CLI_PROFILE`）
-   - `instanceName`：比如 `"gemini"`。`install-autostart.ps1` 会注册成 `LarkClaudeBridge-gemini`，不会覆盖第一个实例的自启
+   - `instanceName`：比如 `"gemini"`。`install-autostart.ps1` 会创建启动项 `LarkClaudeBridge-gemini.lnk`，不会覆盖第一个实例的自启
    - `agent`、`botName`、`allowedOpenId`（新应用下你的 open_id 不一样，要重新取）
 4. 照常 `.\start.ps1 -Check` → `.\install-autostart.ps1` → `.\start-background.ps1`。
 
