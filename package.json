@@ -1,0 +1,11 @@
+{
+  "name": "lark-cli-bridge",
+  "version": "2026.11.24-codex.1",
+  "private": true,
+  "description": "Local Lark CLI bridge with independent Codex conversations",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test",
+    "check": "node bridge.js --check"
+  }
+}

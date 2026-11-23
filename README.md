@@ -1,5 +1,7 @@
 # 小八：飞书私人机器人桥接
 
+Codex 独立部署版 `2026.11.24-codex.1` 的配置、验证、打包和回退步骤见 [DEPLOY-CODEX.md](DEPLOY-CODEX.md)。桌面 Codex 与 Lark 机器人分别保存对话，无需记忆同步。
+
 把飞书机器人收到的消息交给本机的 Claude Code 处理，Claude 用 lark-cli 完成任务后，再以机器人身份回复。
 
 ## 工作原理

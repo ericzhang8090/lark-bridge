@@ -8,6 +8,11 @@
 //       node bridge.js --check  自检（路径、飞书身份、claude）
 'use strict';
 
+if (process.argv.includes('--version')) {
+  console.log(require('./package.json').version);
+  process.exit(0);
+}
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -16,6 +21,7 @@ const crypto = require('crypto');
 const readline = require('readline');
 const { StringDecoder } = require('string_decoder');
 const { spawn, spawnSync } = require('child_process');
+const { checkCodexStartup } = require('./codex-preflight');
 
 // ---------- 路径 ----------
 const ROOT = __dirname;
@@ -111,7 +117,9 @@ function promptSources() {
   if (cfg.systemPromptFile) return { full: path.resolve(ROOT, cfg.systemPromptFile) };
   const legacy = path.join(ROOT, 'system-prompt.local.md');
   if (fs.existsSync(legacy)) return { full: legacy };
-  const persona = [path.join(ROOT, 'persona.local.md'), path.join(ROOT, 'persona.md')].find((p) => fs.existsSync(p)) || null;
+  const persona = [path.join(ROOT, 'persona.local.md'),
+    ...(cfg.agent === 'codex' ? [path.join(ROOT, 'persona.codex.md')] : []),
+    path.join(ROOT, 'persona.md')].find((p) => fs.existsSync(p)) || null;
   return { rules: RULES_FILE, persona };
 }
 // 每次调用都重新拼接，改完规则或人设立即生效
@@ -1702,9 +1710,18 @@ async function check() {
 process.on('uncaughtException', (e) => log('ERROR', 'uncaughtException:', e && e.stack || e));
 process.on('unhandledRejection', (e) => log('ERROR', 'unhandledRejection:', e && e.stack || e));
 
-if (process.argv.includes('--check')) {
-  check().then((c) => process.exit(c));
-} else {
+async function startBridge() {
+  if (cfg.agent === 'codex') {
+    const readiness = await checkCodexStartup({
+      larkExe: resolveLark(), codexExe: resolveCodex(), profile: cfg.larkProfile,
+      mcpAvailable: fs.existsSync(LARK_MCP_SCRIPT), run: runProcess,
+    });
+    if (!readiness.ok) {
+      for (const issue of readiness.issues) log('ERROR', `${issue.code}: ${issue.message}`);
+      process.exitCode = 3; // Supervisor also stops: setup failures are not reconnectable.
+      return;
+    }
+  }
   acquireLock();
   log('INFO', `桥接启动 pid=${process.pid} 用户=${os.userInfo().username} lark=${resolveLark()} profile=${cfg.larkProfile || '默认'} agent=${cfg.agent} ${agentExeLabel()}`);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => shutdown(sig));
@@ -1715,4 +1732,10 @@ if (process.argv.includes('--check')) {
     log('INFO', `讨论功能已启用：${cfg.discussionHost ? '主持方' : '嘉宾'}，对方=${cfg.discussionPeer}，共享目录=${DISCUSS_DIR}`);
     setInterval(pollDiscussions, DISCUSS_POLL_MS);
   }
+}
+
+if (process.argv.includes('--check')) {
+  check().then((c) => process.exit(c));
+} else {
+  startBridge().catch((error) => { log('ERROR', `启动失败：${error.message}`); process.exitCode = 3; });
 }

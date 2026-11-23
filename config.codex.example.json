@@ -1,0 +1,13 @@
+{
+  "allowedOpenId": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "instanceName": "codex",
+  "larkProfile": "bot3",
+  "agent": "codex",
+  "botName": "Codex",
+  "codexExe": "",
+  "codexModel": "",
+  "codexEffort": "medium",
+  "sessionIdleResetHours": 24,
+  "allowGroups": true,
+  "maxConcurrent": 2
+}
