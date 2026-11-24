@@ -49,5 +49,6 @@
   "discussionDefaultRounds": 3,
   "discussionMaxRounds": 10,
   "discussionInThread": true,
-  "discussionContextMessages": 30
+  "discussionContextMessages": 30,
+  "discussionTurnTimeoutMinutes": 5
 }

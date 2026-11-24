@@ -83,6 +83,7 @@ const DEFAULTS = {
   discussionMaxRounds: 10,
   discussionInThread: true, // 讨论发在发起消息下的话题里，不刷屏
   discussionContextMessages: 30, // 讨论开始前读取群里最近多少条消息作为背景（需要 im:message.group_msg 权限），0 = 不读
+  discussionTurnTimeoutMinutes: 5, // 对方超过这么久没发言，主持方在群里提示超时并结束讨论
 };
 
 function readJson(file, fallback) {
@@ -1432,19 +1433,51 @@ async function startDiscussion(ev, cmd) {
     log('INFO', `收到 /讨论，但本机器人不是主持方，忽略（由 ${cfg.discussionPeer} 主持）`);
     return;
   }
-  fs.mkdirSync(DISCUSS_DIR, { recursive: true });
-  const ctx = await fetchDiscussionContext(ev.chat_id, ev.message_id);
-  const d = {
-    id: ev.message_id, chatId: ev.chat_id, rootMessageId: ev.message_id,
-    topic: cmd.topic, rounds: cmd.rounds, host: cfg.botName, guest: cfg.discussionPeer,
-    context: ctx.text, turns: [], next: cfg.botName, status: 'running', createdAt: Date.now(),
-  };
-  writeDiscussion(d);
-  log('INFO', `开始讨论 ${d.id}：${preview(d.topic)}（${d.rounds} 轮，${d.host} vs ${d.guest}）`);
-  const ctxNote = !cfg.discussionContextMessages ? ''
-    : ctx.text ? `\n已读取群里最近的聊天作为背景。`
-      : ctx.error ? `\n（没能读取群聊记录作为背景：机器人需要开通"获取群组中所有消息"权限 im:message.group_msg。这次只按话题本身讨论。）` : '';
-  await sendReply(target, `🎙️ 讨论开始：**${d.topic}**\n${d.host} 和 ${d.guest} 各发言 ${d.rounds} 轮，最后由 ${d.host} 总结。${cfg.discussionInThread ? '发言都在这条消息的话题里。' : ''}${ctxNote}\n随时 @ 任意一方发 /stop 结束。`, `${d.id}-dstart`);
+  // 表情回执只由主持方负责（嘉宾在上面已经返回），保证原消息上只有一套表情。
+  // OnIt 的 reaction_id 写进讨论记录，讨论结束时由 pollDiscussions → finishDiscussionAck 换成完成/失败表情。
+  const ackRid = await ackStart(ev).catch((e) => { log('WARN', `讨论 ${ev.message_id} 添加表情失败：`, e && e.message || e); return null; });
+  let created = false;
+  try {
+    fs.mkdirSync(DISCUSS_DIR, { recursive: true });
+    const ctx = await fetchDiscussionContext(ev.chat_id, ev.message_id);
+    const d = {
+      id: ev.message_id, chatId: ev.chat_id, rootMessageId: ev.message_id,
+      topic: cmd.topic, rounds: cmd.rounds, host: cfg.botName, guest: cfg.discussionPeer,
+      context: ctx.text, turns: [], next: cfg.botName, status: 'running', createdAt: Date.now(),
+      ack: true, ackRid,
+    };
+    writeDiscussion(d);
+    created = true;
+    log('INFO', `开始讨论 ${d.id}：${preview(d.topic)}（${d.rounds} 轮，${d.host} vs ${d.guest}）`);
+    const ctxNote = !cfg.discussionContextMessages ? ''
+      : ctx.text ? `\n已读取群里最近的聊天作为背景。`
+        : ctx.error ? `\n（没能读取群聊记录作为背景：机器人需要开通"获取群组中所有消息"权限 im:message.group_msg。这次只按话题本身讨论。）` : '';
+    await sendReply(target, `🎙️ 讨论开始：**${d.topic}**\n${d.host} 和 ${d.guest} 各发言 ${d.rounds} 轮，最后由 ${d.host} 总结。${cfg.discussionInThread ? '发言都在这条消息的话题里，点开原消息的话题查看。' : ''}${ctxNote}\n随时 @ 任意一方发 /stop 结束。`, `${d.id}-dstart`);
+  } catch (e) {
+    log('ERROR', `发起讨论 ${ev.message_id} 失败：`, e && e.stack || e);
+    // 记录已建好：标成出错，由轮询负责换表情；记录没建成：这里直接换成失败表情
+    if (created) updateDiscussion(ev.message_id, (x) => { if (x.status !== 'running') return false; x.status = 'error'; x.error = String(e && e.message || e); });
+    else await ackEnd(ev, ackRid, false).catch(() => {});
+    await sendReply(target, `⚠️ 发起讨论失败：${e && e.message || e}`, `${ev.message_id}-dstart-err`).catch(() => {});
+  }
+}
+
+// 讨论结束（done / error / stopped）后，把原消息上的 OnIt 换成完成或失败表情。
+// 只处理本机作为主持方、且由新版本发起（带 ack 标记）的讨论；ackFinal 写回记录，重启后也不会重复处理。
+const discussAckFinishing = new Set();
+async function finishDiscussionAck(d) {
+  if (!d.ack || d.ackFinal || d.host !== cfg.botName || discussAckFinishing.has(d.id)) return;
+  discussAckFinishing.add(d.id);
+  try {
+    const ok = d.status === 'done';
+    await ackEnd({ message_id: d.rootMessageId }, d.ackRid, ok);
+    updateDiscussion(d.id, (x) => { x.ackFinal = ok ? 'done' : 'fail'; });
+    log('INFO', `讨论 ${d.id} 结束（${d.status}），表情已换成 ${ok ? cfg.doneEmoji : cfg.failEmoji}`);
+  } catch (e) {
+    log('WARN', `讨论 ${d.id} 更新表情失败：`, e && e.message || e);
+  } finally {
+    discussAckFinishing.delete(d.id);
+  }
 }
 
 // 本聊天里正在进行的讨论全部停止（/stop 时调用）；返回停止的场数
@@ -1556,17 +1589,26 @@ function pollDiscussions() {
     const ctl = discussBusy.get(d.id);
     if (ctl && d.status !== 'running') { ctl.stopped = true; if (ctl.child) killTree(ctl.child.pid); continue; }
     if (d.status !== 'running') {
+      if (d.ack && !d.ackFinal) { finishDiscussionAck(d); continue; } // 先换表情，下一轮再考虑清理
       // 结束超过 1 天的记录清理掉
       if (now - (d.updatedAt || 0) > 86400000) { try { fs.unlinkSync(file); } catch { /* ignore */ } }
       continue;
     }
+    const turnTimeoutMin = Math.max(Number(cfg.discussionTurnTimeoutMinutes) || 5, 1);
     if (d.next === cfg.botName) {
       if (!ctl) takeDiscussionTurn(d);
-    } else if (cfg.discussionHost && d.host === cfg.botName && now - d.updatedAt > (cfg.claudeTimeoutMinutes + 2) * 60000) {
-      // 对方超时没发言（可能没在运行）：主持方收尾
+    } else if (cfg.discussionHost && d.host === cfg.botName && now - d.updatedAt > turnTimeoutMin * 60000) {
+      // 对方超时没发言（可能没在运行）：主持方收尾；状态变成 error 后，下一次轮询会把表情换成失败
       const who = d.next;
-      updateDiscussion(d.id, (x) => { if (x.status !== 'running' || x.next !== who) return false; x.status = 'error'; x.error = `${who} 没有响应`; });
-      sendReply({ replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread }, `⚠️ ${who} 超过 ${cfg.claudeTimeoutMinutes + 2} 分钟没有发言（可能没在运行），讨论结束。`, `${d.id}-timeout`).catch(() => {});
+      const timedOut = updateDiscussion(d.id, (x) => { if (x.status !== 'running' || x.next !== who) return false; x.status = 'error'; x.error = `${who} 超时没有发言`; });
+      if (timedOut && timedOut.status === 'error') {
+        log('WARN', `讨论 ${d.id}：${who} 超过 ${turnTimeoutMin} 分钟没有发言，结束讨论`);
+        const timeoutText = `⚠️ 讨论超时：${who} 超过 ${turnTimeoutMin} 分钟没有发言（可能没在运行），讨论结束。`;
+        const sends = [sendReply({ replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread }, timeoutText, `${d.id}-timeout`)];
+        // 讨论在话题里进行时，再在群里（话题外）提示一次，避免用户看不到
+        if (cfg.discussionInThread) sends.push(sendReply({ chatId: d.chatId }, timeoutText, `${d.id}-timeout-chat`));
+        Promise.all(sends).catch(() => {});
+      }
     }
   }
 }
