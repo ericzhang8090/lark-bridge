@@ -99,7 +99,7 @@ test('real bridge exits before event subscription when selected profile is missi
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lark-preflight-'));
   try {
     fs.writeFileSync(path.join(directory, 'package.json'), '{"type":"commonjs"}');
-    for (const file of ['bridge.js', 'codex-preflight.js']) {
+    for (const file of ['bridge.js', 'codex-preflight.js', 'mail-digest.js']) {
       fs.copyFileSync(path.join(__dirname, '..', file), path.join(directory, file));
     }
     fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify({

@@ -44,7 +44,8 @@ Codex 独立部署版 `2026.11.24-codex.1` 的配置、验证、打包和回退�
 | 文件 | 作用 |
 |---|---|
 | `bridge.js` | 主程序。`node bridge.js --check` 用于自检 |
-| `config.json` | 白名单 open_id、超时、回执文字、群聊开关等 |
+| `config.json` | 白名单 open_id、超时、回执文字、群聊开关、邮件汇报等 |
+| `mail-digest.js` | 定时汇报收件箱新邮件的调度逻辑（时间点、补报、状态文件）；测试在 `tests/` |
 | `system-prompt.md` | 给 Claude 的工作规则（入库，随 `git pull` 更新） |
 | `persona.md` | 默认人设（"小八"） |
 | `persona.local.md` | 可选，不入库。存在时代替 `persona.md`，用来给本机机器人换人设；名字用 config.json 的 `botName`。规则和人设每条消息都会重新拼接，改完立即生效 |
@@ -170,7 +171,8 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
 - **流程**：主持方收到 `/讨论` → 建记录、先发言 → 嘉宾回应 → …… 双方各说完 N 轮后，主持方做总结。默认发在发起消息下的话题里。
 - **只聊不动手**：讨论时两个 agent 都不给任何工具（Claude 用空的 `--tools`，agy 把所有命令放进 deny，Gemini 用不放行 shell 的策略），只输出文字，不会动你的数据，也不会把私人信息带进群。
 - **群聊背景**：主持方发起前，由桥接程序（不是 agent）读取群里最近 `discussionContextMessages` 条消息（默认 30，0 = 不读），写进讨论记录，两边发言时都能看到。先用机器人身份读，失败再用用户身份。机器人身份需要开通"获取群组中所有消息"权限 `im:message.group_msg`；读不到时照常讨论，并在开场消息里说明。
-- **停止**：@ 任意一方发 `/stop`，本群所有进行中的讨论都会结束，正在生成的发言也会被中止。对方超过 `claudeTimeoutMinutes + 2` 分钟没发言（比如没在运行），主持方会在群里说明并结束。
+- **停止**：@ 任意一方发 `/stop`，本群所有进行中的讨论都会结束，正在生成的发言也会被中止。对方超过 `discussionTurnTimeoutMinutes` 分钟（默认 5）没发言（比如没在运行），主持方会在话题里和群里提示"讨论超时"并结束。
+- **表情回执**：只由主持方在发起消息上加表情：发起时加"处理中"（`ackEmoji`），正常总结完换成 `doneEmoji`，出错、超时或被 /stop 时换成 `failEmoji`。嘉宾不加表情，所以原消息上只有一套。加表情失败只记日志，不影响讨论。
 - **配置**（两个实例的 config.json）：
 
   | 配置 | 主持方（如小八） | 嘉宾（如 GiGi） |
@@ -182,6 +184,31 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
 
   可选：`discussionDefaultRounds`（默认 3）、`discussionMaxRounds`（默认 10）、`discussionInThread`（默认 true）。`discussionPeer` 必须和对方 config 里的 `botName` 完全一致。
 - **前提**：两个机器人都要被拉进这个群，且都开通了群消息相关权限。只需要 @ 主持方；嘉宾不处理 `/讨论` 命令。
+
+## 定时汇报收件箱新邮件（`mailDigest`）
+
+每天固定时间点把收件箱新邮件逐封一句话私聊给你。config.json：
+
+```json
+"mailDigest": {
+  "enabled": true,
+  "times": ["09:00", "18:00"],
+  "timezone": "Asia/Manila",
+  "notifyWhenEmpty": true,
+  "userOpenId": "ou_xxx"
+}
+```
+
+- **调度**：启动后 `startupDelaySeconds`（默认 15）秒检查一次，之后每 `checkIntervalMinutes`（1–5，默认 5）分钟检查一次。算出"最近一个应该汇报的时间点"，比 `state/mail-digest.json` 里的 `last_slot` 新就汇报一次，覆盖 `last_report_at` → 现在。
+- **补报**：关机、睡眠、断网错过了时间点，开机后只发**一条**，开头写"补报：覆盖 X 到 Y"。错过多个时间点，或者晚于时间点 `catchupGraceMinutes`（默认 15）分钟才发出，都算补报。
+- **首次运行**（没有状态文件）：从最近一个时间点开始算，不会把历史邮件全发一遍。
+- **流程**：桥接先用 `lark-cli auth status` 确认用户身份可用，再自己用 `mail +triage --as user`（time_range 过滤）和 `mail +messages --html=false` 读邮件（参数数组直接启动 lark-cli.exe：PowerShell 5.1 会吃掉 `--filter` JSON 里的双引号）；然后把邮件作为数据交给 agent，开一个**不带任何工具**的一次性会话逐封概括（邮件里的"指令"不会被执行）；最后像普通回复一样以机器人身份私聊发出。
+- **失败不漏邮件**：只有消息发送成功后才更新状态文件。读邮件或发送失败时私聊提醒一次，`retryMinutes`（默认 10）分钟后重试；用户身份不可用（登录过期、DPoP 密钥丢失）时私聊"邮件汇报失败：需要运行 `lark-cli auth login`"，之后每次检查都会再试，登录好后下一次检查自动补报。agent 概括失败时退回只列标题，照常发出。
+- **没有新邮件**：发"X 到 Y 没有新邮件"；`notifyWhenEmpty: false` 时不发，但状态照样推进。
+- 启动检查和定时检查不会同时发两条（进程内的进行中标记 + 桥接本身的单实例锁）。`/status` 会显示上次汇报到什么时候。
+- 其他可选项：`model`（概括用的模型，留空用 agent 默认）、`maxMails`（一次最多读多少封，默认 100）。
+- **预览**：`node bridge.js --mail-digest-preview [小时数]` 用真实邮箱和 agent 生成一份汇报，写到 `work/mail-digest-preview.txt`，不发消息、不改状态。
+- **测试**：`node --test tests/mail-digest.test.js`（模拟时钟，不碰真实邮箱）。
 
 ## 注意事项
 

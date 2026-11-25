@@ -22,6 +22,7 @@ const readline = require('readline');
 const { StringDecoder } = require('string_decoder');
 const { spawn, spawnSync } = require('child_process');
 const { checkCodexStartup } = require('./codex-preflight');
+const mailDigest = require('./mail-digest');
 
 // ---------- 路径 ----------
 const ROOT = __dirname;
@@ -32,6 +33,7 @@ const LOG_DIR = path.join(ROOT, 'logs');
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const LOCK_FILE = path.join(STATE_DIR, 'bridge.lock');
+const MAIL_DIGEST_STATE_FILE = path.join(STATE_DIR, 'mail-digest.json');
 // agent=gemini 时作为 GEMINI_CLI_HOME：登录凭据、会话记录、策略都在这里，和你自己用的 ~/.gemini 隔离
 const GEMINI_HOME = path.join(STATE_DIR, 'gemini-home');
 const GEMINI_REL = path.join('node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
@@ -89,6 +91,9 @@ const DEFAULTS = {
   discussionMaxRounds: 10,
   discussionInThread: true, // 讨论发在发起消息下的话题里，不刷屏
   discussionContextMessages: 30, // 讨论开始前读取群里最近多少条消息作为背景（需要 im:message.group_msg 权限），0 = 不读
+  discussionTurnTimeoutMinutes: 5, // 对方超过这么久没发言，主持方在群里提示超时并结束讨论
+  // 定时汇报收件箱新邮件：{ enabled, times, timezone, notifyWhenEmpty, userOpenId, ... }，默认值见 mail-digest.js
+  mailDigest: {},
 };
 
 function readJson(file, fallback) {
@@ -135,6 +140,12 @@ function systemPromptFile() {
 }
 if (!/^ou_[0-9a-z]+$/i.test(cfg.allowedOpenId)) {
   console.error('config.json 不存在或 allowedOpenId 无效：请把 config.example.json 复制为 config.json，并填写 allowedOpenId');
+  process.exit(3);
+}
+try {
+  cfg.mailDigest = mailDigest.normalizeConfig(userCfg.mailDigest, cfg.allowedOpenId);
+} catch (e) {
+  console.error(`config.json 里的 mailDigest 配置无效：${e.message}`);
   process.exit(3);
 }
 
@@ -1167,6 +1178,7 @@ async function runCommand(cmd, ev) {
       `- 全局：${activeSlots}/${cfg.maxConcurrent} 个任务在跑，${slotWaiters.length} 个在等空位`,
       `- 本聊天：${c.ctl ? `正在处理（已 ${Math.round((Date.now() - c.startedAt) / 1000)} 秒，${c.ctl.steps} 步${c.ctl.lastStep ? `，最近：${c.ctl.lastStep}` : ''}）` : '空闲'}，排队 ${c.queued} 条`,
       `- 本聊天会话：${sid ? sid.slice(0, 8) + '…' : '（无）'}`,
+      `- 邮件汇报：${mailDigestStatus()}`,
     ].join('\n'), id);
   } else if (cmd === 'help') {
     await sendReply(target, [
@@ -1440,19 +1452,51 @@ async function startDiscussion(ev, cmd) {
     log('INFO', `收到 /讨论，但本机器人不是主持方，忽略（由 ${cfg.discussionPeer} 主持）`);
     return;
   }
-  fs.mkdirSync(DISCUSS_DIR, { recursive: true });
-  const ctx = await fetchDiscussionContext(ev.chat_id, ev.message_id);
-  const d = {
-    id: ev.message_id, chatId: ev.chat_id, rootMessageId: ev.message_id,
-    topic: cmd.topic, rounds: cmd.rounds, host: cfg.botName, guest: cfg.discussionPeer,
-    context: ctx.text, turns: [], next: cfg.botName, status: 'running', createdAt: Date.now(),
-  };
-  writeDiscussion(d);
-  log('INFO', `开始讨论 ${d.id}：${preview(d.topic)}（${d.rounds} 轮，${d.host} vs ${d.guest}）`);
-  const ctxNote = !cfg.discussionContextMessages ? ''
-    : ctx.text ? `\n已读取群里最近的聊天作为背景。`
-      : ctx.error ? `\n（没能读取群聊记录作为背景：机器人需要开通"获取群组中所有消息"权限 im:message.group_msg。这次只按话题本身讨论。）` : '';
-  await sendReply(target, `🎙️ 讨论开始：**${d.topic}**\n${d.host} 和 ${d.guest} 各发言 ${d.rounds} 轮，最后由 ${d.host} 总结。${cfg.discussionInThread ? '发言都在这条消息的话题里。' : ''}${ctxNote}\n随时 @ 任意一方发 /stop 结束。`, `${d.id}-dstart`);
+  // 表情回执只由主持方负责（嘉宾在上面已经返回），保证原消息上只有一套表情。
+  // OnIt 的 reaction_id 写进讨论记录，讨论结束时由 pollDiscussions → finishDiscussionAck 换成完成/失败表情。
+  const ackRid = await ackStart(ev).catch((e) => { log('WARN', `讨论 ${ev.message_id} 添加表情失败：`, e && e.message || e); return null; });
+  let created = false;
+  try {
+    fs.mkdirSync(DISCUSS_DIR, { recursive: true });
+    const ctx = await fetchDiscussionContext(ev.chat_id, ev.message_id);
+    const d = {
+      id: ev.message_id, chatId: ev.chat_id, rootMessageId: ev.message_id,
+      topic: cmd.topic, rounds: cmd.rounds, host: cfg.botName, guest: cfg.discussionPeer,
+      context: ctx.text, turns: [], next: cfg.botName, status: 'running', createdAt: Date.now(),
+      ack: true, ackRid,
+    };
+    writeDiscussion(d);
+    created = true;
+    log('INFO', `开始讨论 ${d.id}：${preview(d.topic)}（${d.rounds} 轮，${d.host} vs ${d.guest}）`);
+    const ctxNote = !cfg.discussionContextMessages ? ''
+      : ctx.text ? `\n已读取群里最近的聊天作为背景。`
+        : ctx.error ? `\n（没能读取群聊记录作为背景：机器人需要开通"获取群组中所有消息"权限 im:message.group_msg。这次只按话题本身讨论。）` : '';
+    await sendReply(target, `🎙️ 讨论开始：**${d.topic}**\n${d.host} 和 ${d.guest} 各发言 ${d.rounds} 轮，最后由 ${d.host} 总结。${cfg.discussionInThread ? '发言都在这条消息的话题里，点开原消息的话题查看。' : ''}${ctxNote}\n随时 @ 任意一方发 /stop 结束。`, `${d.id}-dstart`);
+  } catch (e) {
+    log('ERROR', `发起讨论 ${ev.message_id} 失败：`, e && e.stack || e);
+    // 记录已建好：标成出错，由轮询负责换表情；记录没建成：这里直接换成失败表情
+    if (created) updateDiscussion(ev.message_id, (x) => { if (x.status !== 'running') return false; x.status = 'error'; x.error = String(e && e.message || e); });
+    else await ackEnd(ev, ackRid, false).catch(() => {});
+    await sendReply(target, `⚠️ 发起讨论失败：${e && e.message || e}`, `${ev.message_id}-dstart-err`).catch(() => {});
+  }
+}
+
+// 讨论结束（done / error / stopped）后，把原消息上的 OnIt 换成完成或失败表情。
+// 只处理本机作为主持方、且由新版本发起（带 ack 标记）的讨论；ackFinal 写回记录，重启后也不会重复处理。
+const discussAckFinishing = new Set();
+async function finishDiscussionAck(d) {
+  if (!d.ack || d.ackFinal || d.host !== cfg.botName || discussAckFinishing.has(d.id)) return;
+  discussAckFinishing.add(d.id);
+  try {
+    const ok = d.status === 'done';
+    await ackEnd({ message_id: d.rootMessageId }, d.ackRid, ok);
+    updateDiscussion(d.id, (x) => { x.ackFinal = ok ? 'done' : 'fail'; });
+    log('INFO', `讨论 ${d.id} 结束（${d.status}），表情已换成 ${ok ? cfg.doneEmoji : cfg.failEmoji}`);
+  } catch (e) {
+    log('WARN', `讨论 ${d.id} 更新表情失败：`, e && e.message || e);
+  } finally {
+    discussAckFinishing.delete(d.id);
+  }
 }
 
 // 本聊天里正在进行的讨论全部停止（/stop 时调用）；返回停止的场数
@@ -1564,19 +1608,169 @@ function pollDiscussions() {
     const ctl = discussBusy.get(d.id);
     if (ctl && d.status !== 'running') { ctl.stopped = true; if (ctl.child) killTree(ctl.child.pid); continue; }
     if (d.status !== 'running') {
+      if (d.ack && !d.ackFinal) { finishDiscussionAck(d); continue; } // 先换表情，下一轮再考虑清理
       // 结束超过 1 天的记录清理掉
       if (now - (d.updatedAt || 0) > 86400000) { try { fs.unlinkSync(file); } catch { /* ignore */ } }
       continue;
     }
+    const turnTimeoutMin = Math.max(Number(cfg.discussionTurnTimeoutMinutes) || 5, 1);
     if (d.next === cfg.botName) {
       if (!ctl) takeDiscussionTurn(d);
-    } else if (cfg.discussionHost && d.host === cfg.botName && now - d.updatedAt > (cfg.claudeTimeoutMinutes + 2) * 60000) {
-      // 对方超时没发言（可能没在运行）：主持方收尾
+    } else if (cfg.discussionHost && d.host === cfg.botName && now - d.updatedAt > turnTimeoutMin * 60000) {
+      // 对方超时没发言（可能没在运行）：主持方收尾；状态变成 error 后，下一次轮询会把表情换成失败
       const who = d.next;
-      updateDiscussion(d.id, (x) => { if (x.status !== 'running' || x.next !== who) return false; x.status = 'error'; x.error = `${who} 没有响应`; });
-      sendReply({ replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread }, `⚠️ ${who} 超过 ${cfg.claudeTimeoutMinutes + 2} 分钟没有发言（可能没在运行），讨论结束。`, `${d.id}-timeout`).catch(() => {});
+      const timedOut = updateDiscussion(d.id, (x) => { if (x.status !== 'running' || x.next !== who) return false; x.status = 'error'; x.error = `${who} 超时没有发言`; });
+      if (timedOut && timedOut.status === 'error') {
+        log('WARN', `讨论 ${d.id}：${who} 超过 ${turnTimeoutMin} 分钟没有发言，结束讨论`);
+        const timeoutText = `⚠️ 讨论超时：${who} 超过 ${turnTimeoutMin} 分钟没有发言（可能没在运行），讨论结束。`;
+        const sends = [sendReply({ replyTo: d.rootMessageId, inThread: !!cfg.discussionInThread }, timeoutText, `${d.id}-timeout`)];
+        // 讨论在话题里进行时，再在群里（话题外）提示一次，避免用户看不到
+        if (cfg.discussionInThread) sends.push(sendReply({ chatId: d.chatId }, timeoutText, `${d.id}-timeout-chat`));
+        Promise.all(sends).catch(() => {});
+      }
     }
   }
+}
+
+// ---------- 定时汇报收件箱新邮件 ----------
+// 调度逻辑在 mail-digest.js；这里提供实际的副作用：
+//   读邮件：桥接程序自己用 lark-cli（用户身份）跑 mail +triage / +messages，参数数组直接启动 exe，不经过 shell
+//   概括：交给 agent（新的一次性会话、不给任何工具），邮件内容只是数据
+//   发送：和普通回复一样用 sendReply 以机器人身份私聊用户；成功后才推进 state/mail-digest.json
+const DIGEST_ENABLED = cfg.mailDigest.enabled;
+const digestStore = mailDigest.fileStateStore(MAIL_DIGEST_STATE_FILE);
+
+// lark-cli 的 JSON 错误里取一句可读的原因
+function larkError(r) {
+  const j = parseJsonOutput(r.stdout) || parseJsonOutput(r.stderr) || {};
+  const e = j.error || {};
+  return preview(e.message || e.hint || r.stderr || r.stdout, 300) || `exit ${r.code}`;
+}
+// lark-cli 的报错是不是"用户身份不可用"（需要重新 auth login）
+function isLarkAuthError(r) {
+  const j = parseJsonOutput(r.stdout) || parseJsonOutput(r.stderr) || {};
+  const e = j.error || {};
+  return /auth|token|dpop|login/i.test(`${e.type || ''} ${e.subtype || ''}`) || mailDigest.AUTH_RE.test(`${r.stderr}\n${r.stdout}`);
+}
+
+async function digestCheckAuth() {
+  const lark = resolveLark();
+  if (!lark) return { ok: true }; // 找不到 lark-cli 的情况交给读邮件那一步报错
+  const r = await runProcess(lark, ['auth', 'status'], { timeoutMs: 30000 });
+  const j = parseJsonOutput(r.stdout) || parseJsonOutput(r.stderr);
+  const user = j && j.identities && j.identities.user;
+  if (!j || !j.identities) return { ok: true }; // 判断不了：照常读邮件，真的不可用时读邮件会报错
+  if (!user) return { ok: false, detail: '没有登录用户身份' };
+  if (user.available === false) return { ok: false, detail: user.message || user.status || '用户身份不可用' };
+  return { ok: true };
+}
+
+async function digestFetchMails({ startIso, endIso, max }) {
+  const lark = resolveLark();
+  if (!lark) return { ok: false, detail: '找不到 lark-cli.exe' };
+  const filter = JSON.stringify({ folder: 'inbox', time_range: { start_time: startIso, end_time: endIso } });
+  const tri = await runProcess(lark, ['mail', '+triage', '--as', 'user', '--format', 'json',
+    '--max', String(max), '--filter', filter], { timeoutMs: 180000 });
+  const tj = tri.code === 0 ? parseJsonOutput(tri.stdout) : null;
+  const list = tj && findKey(tj, 'messages', 'array');
+  if (!list) {
+    const detail = larkError(tri);
+    return { ok: false, auth: isLarkAuthError(tri), detail: `mail +triage 失败：${detail}` };
+  }
+  if (tj.has_more) log('WARN', `邮件汇报：这段时间的邮件超过 ${max} 封，只汇报前 ${max} 封`);
+  // +triage 的 date 是 UTC（如 2026-11-25T08:47:40Z）
+  const mails = list.map((m) => ({ id: m.message_id, date: Date.parse(m.date), from: m.from, subject: m.subject, body: '' }))
+    .filter((m) => m.id && Number.isFinite(m.date));
+  if (!mails.length) return { ok: true, mails };
+  // 读正文（纯文本）给 agent 概括；读不到正文时只用标题概括，不算失败
+  const msg = await runProcess(lark, ['mail', '+messages', '--as', 'user', '--html=false',
+    '--message-ids', mails.map((m) => m.id).join(',')], { timeoutMs: 300000 });
+  const full = msg.code === 0 ? findKey(parseJsonOutput(msg.stdout), 'messages', 'array') : null;
+  if (!full) {
+    const detail = larkError(msg);
+    if (isLarkAuthError(msg)) return { ok: false, auth: true, detail: `mail +messages 失败：${detail}` };
+    log('WARN', `邮件汇报：读取正文失败，只按标题概括：${detail}`);
+    return { ok: true, mails };
+  }
+  const byId = new Map(full.map((m) => [m.message_id, m]));
+  mails.forEach((m, i) => {
+    const f = byId.get(m.id) || full[i];
+    if (f) m.body = String(f.body_plain_text || f.body_preview || '');
+  });
+  return { ok: true, mails };
+}
+
+async function digestSummarize(prompt) {
+  const ctl = { child: null, stopped: false, steps: 0, lastStep: '' };
+  await acquireSlot();
+  try {
+    const opts = { noTools: true };
+    if (cfg.mailDigest.model) opts.model = cfg.mailDigest.model;
+    return await runAgent(prompt, null, ctl, opts); // 一次性会话，不影响用户聊天的上下文
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function digestSend(openId, text, keyBase) {
+  const r = await sendReply({ userId: openId }, text, keyBase);
+  return { ok: !!(r && r.ok) };
+}
+
+const digest = mailDigest.createMailDigest(cfg.mailDigest, {
+  now: () => Date.now(),
+  loadState: () => digestStore.load(),
+  saveState: (s) => digestStore.save(s),
+  checkAuth: digestCheckAuth,
+  fetchMails: digestFetchMails,
+  summarize: digestSummarize,
+  send: digestSend,
+  log,
+});
+
+function startMailDigest() {
+  const c = cfg.mailDigest;
+  log('INFO', `邮件汇报已启用：每天 ${c.times.join(' / ')}（${c.timezone}），每 ${c.checkIntervalMinutes} 分钟检查一次，发给 ${c.userOpenId}`);
+  const run = (trigger) => { if (!shuttingDown) digest.check(trigger).catch((e) => log('ERROR', '邮件汇报异常：', e && e.stack || e)); };
+  setTimeout(() => run('startup'), c.startupDelaySeconds * 1000);
+  setInterval(() => run('timer'), c.checkIntervalMinutes * 60000);
+}
+
+// node bridge.js --mail-digest-preview [小时数]
+// 用真实的 lark-cli 和 agent 生成一份汇报并打印出来（写到 work/mail-digest-preview.txt），不发消息、不改 state。
+// 默认覆盖 last_report_at → 现在；给了小时数就覆盖最近 N 小时。
+async function mailDigestPreview(hoursArg) {
+  const c = cfg.mailDigest;
+  const now = Date.now();
+  let st = null;
+  try { st = digestStore.load(); } catch { /* ignore */ }
+  const hours = Number(hoursArg);
+  const startMs = hours > 0 ? now - hours * 3600000 : (st && Date.parse(st.last_report_at)) || now - 9 * 3600000;
+  const auth = await digestCheckAuth();
+  console.log(`用户身份：${auth.ok ? '可用' : `不可用（${auth.detail}）→ 会私聊：${mailDigest.AUTH_NOTICE}`}`);
+  const got = await digestFetchMails({ startIso: mailDigest.isoIn(startMs, c.timezone), endIso: mailDigest.isoIn(now, c.timezone), max: c.maxMails });
+  if (!got.ok) { console.log(`读邮件失败${got.auth ? '（登录失效）' : ''}：${got.detail}`); return 1; }
+  const mails = got.mails.filter((m) => m.date >= startMs && m.date < now).sort((a, b) => a.date - b.date);
+  console.log(`读到 ${mails.length} 封（其中 ${mails.filter((m) => m.body).length} 封有正文）`);
+  let summaries = {};
+  if (mails.length) {
+    const res = await digestSummarize(mailDigest.buildDigestPrompt({ startMs, endMs: now, tz: c.timezone, mails }));
+    summaries = res.ok ? mailDigest.parseDigestOutput(res.text) : null;
+    if (!summaries) console.log(`摘要生成失败：${preview(res.text, 300)}`);
+  }
+  const text = mailDigest.composeMessage({ startMs, endMs: now, tz: c.timezone, catchup: false, mails, summaries });
+  const out = path.join(WORK_DIR, 'mail-digest-preview.txt');
+  fs.writeFileSync(out, text + '\n', 'utf8');
+  console.log(`预览已写入 ${out}（没有发送，state 没有改动）`);
+  return 0;
+}
+
+function mailDigestStatus() {
+  if (!DIGEST_ENABLED) return '未启用';
+  let st = null;
+  try { st = digestStore.load(); } catch { /* ignore */ }
+  const last = st && st.last_report_at ? mailDigest.shortIn(Date.parse(st.last_report_at), cfg.mailDigest.timezone) : '（还没有）';
+  return `每天 ${cfg.mailDigest.times.join(' / ')}，上次汇报到 ${last}${digest.isBusy() ? '，正在汇报' : ''}`;
 }
 
 // ---------- 事件订阅（长连接） ----------
@@ -1670,6 +1864,8 @@ async function check() {
   if (src.full) console.log(`系统提示词   : ${fileState(src.full)}（完整替换）`);
   else { console.log(`规则         : ${fileState(src.rules)}`); console.log(`人设         : ${fileState(src.persona)}`); }
   console.log(`白名单 open_id: ${cfg.allowedOpenId}`);
+  const md = cfg.mailDigest;
+  console.log(`邮件汇报     : ${md.enabled ? `每天 ${md.times.join(' / ')}（${md.timezone}），发给 ${md.userOpenId}，状态文件 ${MAIL_DIGEST_STATE_FILE}` : '未启用（config.json 里 mailDigest.enabled）'}`);
   console.log(`群聊讨论     : ${DISCUSS_ENABLED ? `${cfg.discussionHost ? '主持方' : '嘉宾'}，对方=${cfg.discussionPeer}，共享目录=${DISCUSS_DIR}` : '未启用（discussionDir / discussionPeer 未填）'}`);
   let ok = !!(lark && agentExe);
   if (lark) {
@@ -1732,10 +1928,13 @@ async function startBridge() {
     log('INFO', `讨论功能已启用：${cfg.discussionHost ? '主持方' : '嘉宾'}，对方=${cfg.discussionPeer}，共享目录=${DISCUSS_DIR}`);
     setInterval(pollDiscussions, DISCUSS_POLL_MS);
   }
+  if (DIGEST_ENABLED) startMailDigest();
 }
 
 if (process.argv.includes('--check')) {
   check().then((c) => process.exit(c));
+} else if (process.argv.includes('--mail-digest-preview')) {
+  mailDigestPreview(process.argv[process.argv.indexOf('--mail-digest-preview') + 1]).then((c) => process.exit(c));
 } else {
   startBridge().catch((error) => { log('ERROR', `启动失败：${error.message}`); process.exitCode = 3; });
 }
