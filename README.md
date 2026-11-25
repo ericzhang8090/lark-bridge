@@ -42,7 +42,8 @@
 | 文件 | 作用 |
 |---|---|
 | `bridge.js` | 主程序。`node bridge.js --check` 用于自检 |
-| `config.json` | 白名单 open_id、超时、回执文字、群聊开关等 |
+| `config.json` | 白名单 open_id、超时、回执文字、群聊开关、邮件汇报等 |
+| `mail-digest.js` | 定时汇报收件箱新邮件的调度逻辑（时间点、补报、状态文件）；测试在 `tests/` |
 | `system-prompt.md` | 给 Claude 的工作规则（入库，随 `git pull` 更新） |
 | `persona.md` | 默认人设（"小八"） |
 | `persona.local.md` | 可选，不入库。存在时代替 `persona.md`，用来给本机机器人换人设；名字用 config.json 的 `botName`。规则和人设每条消息都会重新拼接，改完立即生效 |
@@ -181,6 +182,31 @@ cd <桥接目录>\work ; agy                                # 交互运行一次
 
   可选：`discussionDefaultRounds`（默认 3）、`discussionMaxRounds`（默认 10）、`discussionInThread`（默认 true）。`discussionPeer` 必须和对方 config 里的 `botName` 完全一致。
 - **前提**：两个机器人都要被拉进这个群，且都开通了群消息相关权限。只需要 @ 主持方；嘉宾不处理 `/讨论` 命令。
+
+## 定时汇报收件箱新邮件（`mailDigest`）
+
+每天固定时间点把收件箱新邮件逐封一句话私聊给你。config.json：
+
+```json
+"mailDigest": {
+  "enabled": true,
+  "times": ["09:00", "18:00"],
+  "timezone": "Asia/Manila",
+  "notifyWhenEmpty": true,
+  "userOpenId": "ou_xxx"
+}
+```
+
+- **调度**：启动后 `startupDelaySeconds`（默认 15）秒检查一次，之后每 `checkIntervalMinutes`（1–5，默认 5）分钟检查一次。算出"最近一个应该汇报的时间点"，比 `state/mail-digest.json` 里的 `last_slot` 新就汇报一次，覆盖 `last_report_at` → 现在。
+- **补报**：关机、睡眠、断网错过了时间点，开机后只发**一条**，开头写"补报：覆盖 X 到 Y"。错过多个时间点，或者晚于时间点 `catchupGraceMinutes`（默认 15）分钟才发出，都算补报。
+- **首次运行**（没有状态文件）：从最近一个时间点开始算，不会把历史邮件全发一遍。
+- **流程**：桥接先用 `lark-cli auth status` 确认用户身份可用，再自己用 `mail +triage --as user`（time_range 过滤）和 `mail +messages --html=false` 读邮件（参数数组直接启动 lark-cli.exe：PowerShell 5.1 会吃掉 `--filter` JSON 里的双引号）；然后把邮件作为数据交给 agent，开一个**不带任何工具**的一次性会话逐封概括（邮件里的"指令"不会被执行）；最后像普通回复一样以机器人身份私聊发出。
+- **失败不漏邮件**：只有消息发送成功后才更新状态文件。读邮件或发送失败时私聊提醒一次，`retryMinutes`（默认 10）分钟后重试；用户身份不可用（登录过期、DPoP 密钥丢失）时私聊"邮件汇报失败：需要运行 `lark-cli auth login`"，之后每次检查都会再试，登录好后下一次检查自动补报。agent 概括失败时退回只列标题，照常发出。
+- **没有新邮件**：发"X 到 Y 没有新邮件"；`notifyWhenEmpty: false` 时不发，但状态照样推进。
+- 启动检查和定时检查不会同时发两条（进程内的进行中标记 + 桥接本身的单实例锁）。`/status` 会显示上次汇报到什么时候。
+- 其他可选项：`model`（概括用的模型，留空用 agent 默认）、`maxMails`（一次最多读多少封，默认 100）。
+- **预览**：`node bridge.js --mail-digest-preview [小时数]` 用真实邮箱和 agent 生成一份汇报，写到 `work/mail-digest-preview.txt`，不发消息、不改状态。
+- **测试**：`node --test tests/mail-digest.test.js`（模拟时钟，不碰真实邮箱）。
 
 ## 注意事项
 

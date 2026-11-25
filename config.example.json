@@ -50,5 +50,15 @@
   "discussionMaxRounds": 10,
   "discussionInThread": true,
   "discussionContextMessages": 30,
-  "discussionTurnTimeoutMinutes": 5
+  "discussionTurnTimeoutMinutes": 5,
+
+  "mailDigest": {
+    "enabled": false,
+    "times": ["09:00", "18:00"],
+    "timezone": "Asia/Manila",
+    "notifyWhenEmpty": true,
+    "userOpenId": "",
+    "checkIntervalMinutes": 5,
+    "model": ""
+  }
 }
