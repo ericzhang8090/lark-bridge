@@ -111,7 +111,7 @@ if (!['claude', 'gemini', 'agy', 'codex'].includes(cfg.agent)) {
   console.error(`config.json 里的 agent 只能是 claude、gemini、agy 或 codex，当前是 ${cfg.agent}`);
   process.exit(3);
 }
-// codex 的 /q 快速模式不换模型（用 ChatGPT 账号时可用的模型名不固定），只把推理强度降到 low
+// Codex 的 /q 使用配置的 quickModel 或默认模型，推理强度固定为 low。
 if (!cfg.quickModel) cfg.quickModel = { claude: 'haiku', gemini: 'flash', agy: 'gemini-3.8-flash-low', codex: '' }[cfg.agent];
 // 系统提示词 = system-prompt.md（规则，入库）+ 人设。人设优先用不入库的 persona.local.md，
 // 没有再用 persona.md。这样规则随 git pull 更新，本机人设不会冲突。
@@ -338,6 +338,7 @@ function runProcess(exe, args, { input = null, cwd = WORK_DIR, timeoutMs = 60000
 
 // ---------- 状态 ----------
 const state = Object.assign({ sessions: {}, seen: [] }, readJson(STATE_FILE, {}));
+state.codexModels = Object.assign(Object.create(null), state.codexModels);
 delete state.sessionId; delete state.sessionUpdatedAt; // 旧版单会话字段
 let seen = new Set(state.seen);
 
@@ -873,6 +874,12 @@ async function runAgy(prompt, sessionId, ctl = {}, opts = {}) {
 // 同时关掉 apps / plugins / 浏览器 / computer use，不加载你自己的 Codex 配置和规则；
 // CODEX_HOME 指向 state/codex-home，登录凭据和会话记录与 Codex 桌面应用隔离（需要用 codex-login.ps1 登录一次）。
 const CODEX_DISABLED_FEATURES = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'in_app_browser', 'computer_use'];
+const CODEX_MODEL_PRESETS = new Map([
+  ['sol', { model: 'gpt-6.2-sol', effort: 'medium' }],
+  ['astra', { model: 'gpt-6.2-astra', effort: 'high' }],
+]);
+const CODEX_MODEL_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+const CODEX_MODEL_HELP = '用法：`/model` 查看设置，`/model sol` 或 `/model astra` 切换，`/model astra xhigh` 自选推理强度，`/model default` 恢复默认。';
 const CODEX_RULES_NOTE = `
 
 # 调用 lark-cli 的方式（Codex）
@@ -902,10 +909,11 @@ async function runCodex(prompt, sessionId, ctl = {}, opts = {}) {
   const src = fs.readFileSync(systemPromptFile(), 'utf8');
   fs.writeFileSync(path.join(WORK_DIR, 'AGENTS.md'), src.trimEnd() + CODEX_RULES_NOTE, 'utf8');
   fs.mkdirSync(CODEX_HOME, { recursive: true });
+  const effort = opts.quick ? 'low' : opts.effort || cfg.codexEffort || 'medium';
   const common = [
     '--json', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules',
     '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"',
-    '-c', `model_reasoning_effort="${opts.quick ? 'low' : cfg.codexEffort || 'medium'}"`,
+    '-c', `model_reasoning_effort="${effort}"`,
     ...CODEX_DISABLED_FEATURES.flatMap((f) => ['--disable', f]),
   ];
   if (!opts.noTools) { // 讨论模式只聊不动手：连 lark_cli 工具也不给
@@ -953,11 +961,13 @@ async function runCodex(prompt, sessionId, ctl = {}, opts = {}) {
     return { ok: true, secs, cost: null, sessionId: sid, text: acc.text.trim() || '（任务已完成，没有文字输出）' };
   }
   const detail = acc.error || (r.stderr || r.stdout).trim().slice(-800);
-  if (sessionId && /no rollout|not found|no session|找不到/i.test(detail)) return { ok: false, resumeFailed: true, text: detail };
+  if (sessionId && /no (?:rollout|session)|(?:session|thread|rollout)[^\n]{0,100}not found|(?:找不到|未找到)(?:会话|线程)/i.test(detail)) {
+    return { ok: false, resumeFailed: true, text: detail };
+  }
   if (/log ?in|login|auth|401|unauthori[sz]ed/i.test(detail)) {
     return { ok: false, text: 'Codex 没有登录或登录已过期：请在桥接目录运行 .\\codex-login.ps1 用 ChatGPT 账号登录后再试。' };
   }
-  return { ok: false, sessionId: sid, text: `处理出错（exit ${r.code}）：\n${detail}` };
+  return { ok: false, text: `处理出错（exit ${r.code}）：\n${detail}` };
 }
 
 const runAgent = { claude: runClaude, gemini: runGemini, agy: runAgy, codex: runCodex }[cfg.agent];
@@ -1148,6 +1158,26 @@ const COMMANDS = {
 };
 
 // 命令立即执行，不进队列（否则 /stop 会排在要停的任务后面）
+async function runModelCommand(ev, args) {
+  const [name, effort, extra] = args.trim().toLowerCase().split(/\s+/);
+  const preset = CODEX_MODEL_PRESETS.get(name);
+  if (name === 'default' && !effort) {
+    delete state.codexModels[ev.chat_id];
+    saveState();
+  } else if (preset && !extra && (!effort || CODEX_MODEL_EFFORTS.includes(effort))) {
+    state.codexModels[ev.chat_id] = { ...preset, effort: effort || preset.effort };
+    saveState();
+  } else if (name) {
+    await sendReply(replyTarget(ev), CODEX_MODEL_HELP, ev.message_id);
+    return;
+  }
+  const current = state.codexModels[ev.chat_id];
+  const model = current?.model || cfg.codexModel || 'Codex 默认模型';
+  const reasoning = current?.effort || cfg.codexEffort || 'medium';
+  const message = `本聊天模型：${model}，推理强度：${reasoning}。${name ? '之后发送的普通消息使用这个设置，并延续当前对话。' : '\n\n' + CODEX_MODEL_HELP}`;
+  await sendReply(replyTarget(ev), message, ev.message_id);
+}
+
 async function runCommand(cmd, ev) {
   const id = ev.message_id;
   const target = replyTarget(ev);
@@ -1188,6 +1218,7 @@ async function runCommand(cmd, ev) {
       '- `/stop` 停止本聊天正在跑的任务，并取消排队的任务',
       '- `/new` 开启新会话（清空本聊天的上下文）',
       '- `/status` 查看运行状态',
+      ...(cfg.agent === 'codex' ? ['- `/model` 查看模型，`/model astra` 或 `/model sol` 切换本聊天的模型'] : []),
       ...(DISCUSS_ENABLED ? [cfg.discussionHost
         ? `- \`/讨论 3轮 话题\`（群里）让我和 ${cfg.discussionPeer} 围绕话题轮流发言，最后我来总结；/stop 可以随时结束`
         : `- 群里 @${cfg.discussionPeer} 发 \`/讨论 3轮 话题\`，我们俩会轮流发言`] : []),
@@ -1226,7 +1257,7 @@ function startProgress(ev, ctl, t0) {
   };
 }
 
-async function runTask(ev, c, ackRid) {
+async function runTask(ev, c, ackRid, codexOptions) {
   const id = ev.message_id;
   const target = replyTarget(ev);
   const epoch = c.epoch;
@@ -1239,14 +1270,14 @@ async function runTask(ev, c, ackRid) {
     const quoted = await fetchQuoted(ev);
     const attachments = ctl.stopped ? [] : await fetchAttachments(ev, quoted);
     const prompt = buildPrompt(ev, quoted, attachments);
+    const options = ev.quick ? { model: cfg.quickModel, quick: true } : codexOptions;
     let res;
     if (ctl.stopped) res = { stopped: true };
-    else if (ev.quick) res = await runAgent(prompt, null, ctl, { model: cfg.quickModel, quick: true }); // 快速模式：独立会话，不保存
-    else res = await runAgent(prompt, getSession(ev.chat_id), ctl);
+    else res = await runAgent(prompt, ev.quick ? null : getSession(ev.chat_id), ctl, options);
     if (res.resumeFailed && !ctl.stopped) {
       log('WARN', '恢复会话失败，改用新会话重试');
       setSession(ev.chat_id, null);
-      res = await runAgent(prompt, null, ctl);
+      res = await runAgent(prompt, null, ctl, options);
     }
     if (res.stopped || ctl.stopped) {
       await finishProgress(`⏹ 已停止（${summary()}）`);
@@ -1284,6 +1315,8 @@ async function runTask(ev, c, ackRid) {
 
 function enqueue(ev) {
   const c = chatOf(ev.chat_id);
+  // Later /model commands apply only to messages received after the change.
+  const codexOptions = cfg.agent === 'codex' ? state.codexModels[ev.chat_id] : undefined;
   const gen = c.gen;
   c.queued++;
   const ackPromise = ackStart(ev).catch(() => null); // 立即加"处理中"表情，不等排队
@@ -1298,7 +1331,7 @@ function enqueue(ev) {
     await acquireSlot();
     try {
       if (gen !== c.gen) return cancelled();
-      await runTask(ev, c, ackRid);
+      await runTask(ev, c, ackRid, codexOptions);
     } finally {
       releaseSlot();
     }
@@ -1338,6 +1371,10 @@ async function handleEventLine(line) {
   log('INFO', `收到${isGroup ? '群聊 @' : '单聊'}消息 ${id} [${ev.message_type}]${ev.reply_to ? ' (引用回复)' : ''} ${preview(ev.text)}`);
   const cmd = COMMANDS[ev.text.toLowerCase()];
   if (cmd) { await runCommand(cmd, ev); return; }
+  if (cfg.agent === 'codex' && ev.chat_id) {
+    const modelCommand = /^\/model(?:\s+([\s\S]*))?$/i.exec(ev.text);
+    if (modelCommand) { await runModelCommand(ev, modelCommand[1] || ''); return; }
+  }
   const dc = parseDiscussCommand(ev);
   if (dc) { await startDiscussion(ev, dc); return; }
   const q = /^\/q(?:uick)?\s+([\s\S]+)$/i.exec(ev.text);

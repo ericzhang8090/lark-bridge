@@ -16,6 +16,16 @@
 
 ## 版本行为
 
+### 在 Lark 切换模型
+
+- `/model` 查看当前聊天的模型和推理强度。
+- `/model astra` 切换到 GPT-6.2 Astra，默认使用 `high` 推理。`/model sol` 切换到 GPT-6.2 Sol，默认使用 `medium`。
+- `/model astra xhigh` 可指定推理强度。命令接受 `low`、`medium`、`high`、`xhigh`。
+- `/model default` 恢复 `config.json` 中的 `codexModel` 和 `codexEffort`。如果 `codexModel` 留空，新对话使用 Codex CLI 默认模型。
+- 设置按 Lark 聊天保存，重启后仍有效，并继续现有对话。群聊中仍需 @ 机器人。`/q` 继续使用独立的快速模式。
+
+### 启动与运行
+
 - 启动前只读检查 Lark 应用身份和 Codex 登录。缺少 `bot3` 等配置时返回退出码 3，守护脚本停止，不反复重连或切换成别的机器人。
 - Codex 默认使用 `persona.codex.md`；本机 `persona.local.md` 仍优先。
 - `node bridge.js --version` 无需配置即可显示版本号。
